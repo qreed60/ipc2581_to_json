@@ -1,522 +1,265 @@
 #!/usr/bin/env python3
-"""
-ipc2581_to_thomson.py
-
-Best-effort IPC-2581 XML -> ThomsonLint-style JSON exporter.
-
-This is intended as a practical starting point for Altium IPC-2581 exports.
-It emits files named like ThomsonLint expects:
-  <project>-thomson-export-sch.json
-  <project>-thomson-export-brd.json
-  <project>-thomson-export-stack.json
-
-Limitations:
-- IPC-2581 is manufacturing/layout-oriented, not a full schematic database.
-- Pin electrical direction is usually not present, so schematic pins are marked UNK.
-- Different CAD tools use slightly different IPC-2581 attribute naming. This parser is
-  namespace-insensitive and attribute-tolerant, but you should inspect the generated
-  JSON against your first real Altium export.
-
-Usage:
-  python3 ipc2581_to_thomson.py input.xml --project MyBoard --output ./exports
-"""
-
 from __future__ import annotations
 
 import argparse
 import json
 import math
-import re
 import sys
 import xml.etree.ElementTree as ET
-from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
-VERSION = "ipc2581-adapter-0.1"
+VERSION = "ipc2581-adapter-0.3"
 
 
-def strip_ns(tag: str) -> str:
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def local_name(tag: str) -> str:
     return tag.split("}", 1)[-1] if "}" in tag else tag
 
 
-def norm_key(s: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", s.lower())
-
-
-def tag_is(elem: ET.Element, name: str) -> bool:
-    return strip_ns(elem.tag).lower() == name.lower()
-
-
-def iter_tag(root: ET.Element, *names: str) -> Iterable[ET.Element]:
+def iter_by_local_name(root: ET.Element, *names: str):
     wanted = {n.lower() for n in names}
     for e in root.iter():
-        if strip_ns(e.tag).lower() in wanted:
+        if local_name(e.tag).lower() in wanted:
             yield e
 
 
-def attr_any(elem: ET.Element, *names: str, default: str = "") -> str:
-    wanted = [norm_key(n) for n in names]
+def find_by_local_name(root: ET.Element, *names: str):
+    return next(iter_by_local_name(root, *names), None)
+
+
+def get_attr_any(elem: ET.Element, *names: str, default: str = "") -> str:
+    want = {n.lower().replace("_", "") for n in names}
     for k, v in elem.attrib.items():
-        nk = norm_key(k)
-        if nk in wanted:
+        nk = local_name(k).lower().replace("_", "")
+        if nk in want:
             return v
-    # weaker fallback: common variants like refDes vs refdes vs ref-des
-    for k, v in elem.attrib.items():
-        nk = norm_key(k)
-        for w in wanted:
-            if nk == w or nk.endswith(w) or w.endswith(nk):
-                return v
     return default
 
 
-def float_any(elem: ET.Element, *names: str, default: float = 0.0) -> float:
-    val = attr_any(elem, *names, default="")
+def f_any(elem: ET.Element, *names: str, default: float = 0.0) -> float:
     try:
-        return float(val)
+        return float(get_attr_any(elem, *names, default=str(default)))
     except Exception:
         return default
 
 
-def text_of(elem: ET.Element) -> str:
-    return "".join(elem.itertext()).strip()
+@dataclass
+class ExtractionReport:
+    warnings: list[str]
+    errors: list[str]
+    unsupported_features: list[str]
 
 
-def child_text_any(elem: ET.Element, *names: str) -> str:
-    wanted = {n.lower() for n in names}
-    for c in elem:
-        if strip_ns(c.tag).lower() in wanted:
-            txt = text_of(c)
-            if txt:
-                return txt
-    return ""
+def parse_ipc2581(path: Path) -> ET.Element:
+    tree = ET.parse(path)
+    return tree.getroot()
 
 
-def is_power_net(name: str) -> bool:
-    upper = (name or "").upper()
-    for pat in (
-        "VCC", "VDD", "VBUS", "VIN", "VOUT", "VBAT", "VSYS", "VPLUS",
-        "VAUX", "VPP", "VANALOG", "+3V", "+5V", "+12V", "+24V",
-        "+14V", "+15V", "+28V", "+48V", "-5V", "-12V", "-15V",
-        "3V3", "5V0", "1V8", "1V2", "2V5", "14V0", "48V0", "POE", "PWR"
-    ):
-        if pat in upper:
-            return True
-    return False
-
-
-def is_ground_net(name: str) -> bool:
-    upper = (name or "").upper()
-    return upper in {"GND", "AGND", "DGND", "PGND", "SGND"} or "VSS" in upper or "GND" in upper
-
-
-def is_clock_net(name: str) -> bool:
-    upper = (name or "").upper()
-    return any(p in upper for p in ("CLK", "XTAL", "SCK", "SCLK", "MCLK", "BCLK", "LRCK", "OSC"))
-
-
-def is_diff_pair_member(name: str) -> int:
-    upper = (name or "").upper()
-    if upper.endswith(("_P", "DP", "D+", "_DP")):
-        return 1
-    if upper.endswith(("_N", "DN", "D-", "_DN")):
-        return -1
-    return 0
-
-
-def find_diff_partner(name: str) -> str:
-    pairs = {"_P": "_N", "_N": "_P", "DP": "DN", "DN": "DP", "D+": "D-", "D-": "D+", "_DP": "_DN", "_DN": "_DP"}
-    upper = name.upper()
-    for suffix, partner in sorted(pairs.items(), key=lambda kv: -len(kv[0])):
-        if upper.endswith(suffix):
-            return name[: -len(suffix)] + partner
-    return ""
-
-
-def guess_voltage(name: str) -> str | None:
-    upper = (name or "").upper()
-    for pat, val in [
-        ("-15V", "-15V"), ("-12V", "-12V"), ("-5V", "-5V"),
-        ("48V", "48V"), ("POE", "48V"), ("28V", "28V"), ("24V", "24V"),
-        ("15V", "15V"), ("14V", "14V"), ("12V", "12V"),
-        ("3V3", "3.3V"), ("3.3", "3.3V"), ("5V0", "5V"), ("+5V", "5V"),
-        ("1V8", "1.8V"), ("1.8", "1.8V"), ("1V2", "1.2V"), ("1.2", "1.2V"),
-        ("2V5", "2.5V"), ("2.5", "2.5V"), ("VBUS", "5V"), ("VBAT", "3.7V"),
-    ]:
-        if pat in upper:
-            return val
-    return None
-
-
-def classify_component(ref: str, desc: str = "") -> str:
-    if not ref:
-        return "unknown"
-    u = desc.upper()
-    if ref.startswith("FB"):
-        return "ferrite_bead"
-    if ref.startswith("TP"):
-        return "test_point"
-    if ref.startswith("SW"):
-        return "switch"
-    if ref.startswith("BT"):
-        return "battery"
-    if ref.startswith("MH"):
-        return "mounting_hole"
-    c = ref[0].upper()
+def extract_ipc2581_metadata(root: ET.Element, source_file: str, project: str) -> dict[str, Any]:
+    tool = "unknown"
+    txt = ET.tostring(root, encoding="unicode", method="xml")[:1500].lower()
+    if "altium" in txt:
+        tool = "Altium"
     return {
-        "U": "IC", "C": "capacitor", "R": "resistor", "L": "inductor",
-        "Q": "transistor", "J": "connector", "F": "fuse", "T": "transformer",
-        "K": "relay", "X": "crystal", "Y": "crystal",
-    }.get(c, "LED" if c == "D" and "LED" in u else "TVS" if c == "D" and ("TVS" in u or "ESD" in u) else "diode" if c == "D" else "other")
-
-
-def guess_diff_interface(name: str) -> str:
-    upper = name.upper()
-    for pat, iface in (("USB", "USB"), ("ETH", "Ethernet"), ("MDIO", "Ethernet"), ("HDMI", "HDMI"), ("LVDS", "LVDS"), ("CAN", "CAN"), ("RS485", "RS-485"), ("RS-485", "RS-485"), ("PCIE", "PCIe"), ("PCI", "PCIe"), ("SATA", "SATA"), ("MIPI", "MIPI")):
-        if pat in upper:
-            return iface
-    return "unknown"
-
-
-def parse_components(root: ET.Element) -> dict[str, dict[str, Any]]:
-    comps: dict[str, dict[str, Any]] = {}
-    for e in root.iter():
-        tag = strip_ns(e.tag).lower()
-        if tag not in {"component", "comp", "componentref", "componentinstance", "package"}:
-            continue
-        ref = attr_any(e, "refDes", "refdes", "referenceDesignator", "designator", "name", default="")
-        if not re.match(r"^[A-Z]{1,3}\d+[A-Z]?$", ref or ""):
-            continue
-        value = attr_any(e, "value", "partValue", default="") or child_text_any(e, "value")
-        package = attr_any(e, "package", "packageRef", "footprint", "footprintRef", "pkgRef", "part", default="")
-        desc = attr_any(e, "description", "desc", "partDescription", default="") or child_text_any(e, "description", "desc")
-        x = float_any(e, "x", "xLoc", "locationX", "posX", default=0.0)
-        y = float_any(e, "y", "yLoc", "locationY", "posY", default=0.0)
-        rot = float_any(e, "rotation", "rot", "angle", default=0.0)
-        side_raw = attr_any(e, "side", "mountSide", "layerRef", "layer", default="")
-        side = "bottom" if side_raw.lower().startswith(("b", "bottom", "bot")) else "top"
-        comps[ref] = {
-            "ref": ref,
-            "value": value,
-            "package": package,
-            "device": package or desc or ref,
-            "lib_id": package or desc or ref,
-            "description": desc,
-            "populate": True,
-            "type": classify_component(ref, desc),
-            "attributes": {"ipc2581_side_raw": side_raw} if side_raw else {},
-            "x_mm": round(x, 4),
-            "y_mm": round(y, 4),
-            "rotation": round(rot, 1),
-            "side": side,
-            "pads": [],
-        }
-    return comps
-
-
-def parse_nets_and_pins(root: ET.Element) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, str]]]]:
-    """Return ThomsonLint-style schematic nets and net->pin map.
-
-    Handles common IPC-2581 structures loosely:
-    - Net / ElectricalNet / NetList nodes with name attributes
-    - child PinRef / Pin / Connect / Node nodes with component/pin refs
-    """
-    nets: list[dict[str, Any]] = []
-    net_pins: dict[str, list[dict[str, str]]] = defaultdict(list)
-    seen = set()
-    net_tags = {"net", "electricalnet", "logicalnet"}
-    pin_tags = {"pinref", "pin", "connect", "connection", "node", "padref", "landpatternref"}
-
-    for net_elem in root.iter():
-        if strip_ns(net_elem.tag).lower() not in net_tags:
-            continue
-        net_name = attr_any(net_elem, "name", "netName", "net", "signalName", default="")
-        if not net_name or net_name in seen:
-            continue
-        seen.add(net_name)
-        pins = []
-        for p in net_elem.iter():
-            if p is net_elem or strip_ns(p.tag).lower() not in pin_tags:
-                continue
-            ref = attr_any(p, "componentRef", "component", "refDes", "refdes", "designator", "part", default="")
-            pin = attr_any(p, "pin", "pinRef", "pinNumber", "pad", "padRef", "terminal", "name", default="")
-            if ref and pin and re.match(r"^[A-Z]{1,3}\d+[A-Z]?$", ref):
-                pins.append({"part": ref, "pin": pin, "direction": "UNK"})
-        net_pins[net_name].extend(pins)
-        diff_member = is_diff_pair_member(net_name)
-        nets.append({
-            "name": net_name,
-            "class": "Default",
-            "is_power": is_power_net(net_name),
-            "is_ground": is_ground_net(net_name),
-            "is_clock": is_clock_net(net_name),
-            "is_differential": diff_member != 0,
-            "diff_pair_partner": find_diff_partner(net_name) if diff_member else None,
-            "voltage_guess": guess_voltage(net_name),
-            "pins": pins,
-        })
-    return nets, dict(net_pins)
-
-
-def attach_pads_from_net_pins(components: dict[str, dict[str, Any]], net_pins: dict[str, list[dict[str, str]]]) -> None:
-    for net_name, pins in net_pins.items():
-        for p in pins:
-            ref = p.get("part", "")
-            pin = p.get("pin", "")
-            if ref in components:
-                components[ref].setdefault("pads", []).append({
-                    "name": pin,
-                    "x_mm": components[ref].get("x_mm", 0.0),
-                    "y_mm": components[ref].get("y_mm", 0.0),
-                    "net_name": net_name,
-                })
-
-
-def parse_layers(root: ET.Element) -> list[dict[str, Any]]:
-    layers = []
-    seen = set()
-    for e in root.iter():
-        tag = strip_ns(e.tag).lower()
-        if tag not in {"layer", "stackuplayer", "conductorlayer", "dielectriclayer"}:
-            continue
-        name = attr_any(e, "name", "layerName", "id", "layerRef", default="")
-        if not name or name in seen:
-            continue
-        seen.add(name)
-        layer_type = attr_any(e, "type", "layerType", "function", default="")
-        is_copper = any(s in (name + " " + layer_type).lower() for s in ["cu", "signal", "plane", "conductor", "power", "mixed"])
-        layers.append({
-            "number": len(layers) + 1,
-            "name": name,
-            "type": layer_type or ("signal" if is_copper else "dielectric"),
-            "material": attr_any(e, "material", "materialRef", default=""),
-            "thickness_mm": float_any(e, "thickness", "thick", default=0.0),
-            "is_copper": is_copper,
-        })
-    return layers
-
-
-def parse_outline(root: ET.Element) -> dict[str, Any] | None:
-    xs, ys = [], []
-    for e in root.iter():
-        for xk, yk in [("x", "y"), ("xLoc", "yLoc"), ("locationX", "locationY")]:
-            xv = attr_any(e, xk, default="")
-            yv = attr_any(e, yk, default="")
-            if xv and yv:
-                try:
-                    xs.append(float(xv)); ys.append(float(yv))
-                except Exception:
-                    pass
-    if not xs or not ys:
-        return None
-    return {
-        "x1": min(xs), "y1": min(ys), "x2": max(xs), "y2": max(ys),
-        "width_mm": round(max(xs) - min(xs), 4),
-        "height_mm": round(max(ys) - min(ys), 4),
+        "project": project,
+        "source_format": "ipc2581",
+        "source_file": source_file,
+        "source_tool": tool,
+        "converter": VERSION,
+        "conversion_timestamp": now_iso(),
     }
 
 
-def parse_traces_and_vias(root: ET.Element, net_names: set[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    segments = []
-    vias = []
-    for e in root.iter():
-        tag = strip_ns(e.tag).lower()
-        if tag in {"via", "viapadstack", "blindvia", "buriedvia"}:
-            net = attr_any(e, "net", "netName", "signalName", default="")
-            vias.append({
-                "x_mm": float_any(e, "x", "xLoc", "locationX", default=0.0),
-                "y_mm": float_any(e, "y", "yLoc", "locationY", default=0.0),
-                "size": float_any(e, "diameter", "size", default=0.0),
-                "drill": float_any(e, "drill", "hole", "holeDiameter", default=0.0),
-                "net_name": net,
-                "layers": [],
-            })
-        elif tag in {"trace", "segment", "line", "polyline"}:
-            net = attr_any(e, "net", "netName", "signalName", default="")
-            if not net and net_names:
-                continue
-            x1 = float_any(e, "x1", "startX", default=0.0)
-            y1 = float_any(e, "y1", "startY", default=0.0)
-            x2 = float_any(e, "x2", "endX", default=0.0)
-            y2 = float_any(e, "y2", "endY", default=0.0)
-            length = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
-            segments.append({
-                "start": [x1, y1], "end": [x2, y2],
-                "width": float_any(e, "width", "lineWidth", default=0.0),
-                "layer": attr_any(e, "layer", "layerRef", default=""),
-                "net_name": net,
-                "length": length,
-            })
-    return segments, vias
-
-
-def signal_stats(nets: list[dict[str, Any]], segments: list[dict[str, Any]], vias: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    seg_by_net = defaultdict(list)
-    for s in segments:
-        seg_by_net[s.get("net_name", "")].append(s)
-    via_by_net = defaultdict(int)
-    for v in vias:
-        via_by_net[v.get("net_name", "")] += 1
-    out = []
-    for n in nets:
-        name = n["name"]
-        segs = seg_by_net.get(name, [])
-        widths = [s.get("width", 0.0) for s in segs if s.get("width", 0.0)]
-        entry = {
-            "name": name,
-            "is_power": n.get("is_power", False),
-            "is_ground": n.get("is_ground", False),
-            "is_clock": n.get("is_clock", False),
-            "trace_length_mm": round(sum(s.get("length", 0.0) for s in segs), 4),
-            "min_width_mm": round(min(widths), 4) if widths else 0.0,
-            "max_width_mm": round(max(widths), 4) if widths else 0.0,
-            "via_count": via_by_net.get(name, 0),
-            "segment_count": len(segs),
-        }
-        if is_clock_net(name) or is_diff_pair_member(name):
-            entry["trace_segments"] = [
-                {
-                    "layer": s.get("layer", ""),
-                    "x1_mm": round(s["start"][0], 4), "y1_mm": round(s["start"][1], 4),
-                    "x2_mm": round(s["end"][0], 4), "y2_mm": round(s["end"][1], 4),
-                    "width_mm": round(s.get("width", 0.0), 4),
-                } for s in segs
-            ]
-        out.append(entry)
+def extract_ipc2581_components(root: ET.Element, source_file: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for e in iter_by_local_name(root, "Component", "ComponentInstance", "ComponentRef"):
+        ref = get_attr_any(e, "refdes", "designator", "name")
+        if not ref:
+            continue
+        out.append({
+            "refdes": ref,
+            "value": get_attr_any(e, "value", "partvalue", default=None) or None,
+            "footprint": get_attr_any(e, "package", "packageref", "footprint", default=None) or None,
+            "part_number": get_attr_any(e, "partnumber", "mpn", default=None) or None,
+            "source": {
+                "source_format": "ipc2581", "source_file": source_file,
+                "source_element": local_name(e.tag), "source_attributes": dict(e.attrib),
+                "extraction_confidence": "medium",
+            },
+        })
     return out
 
 
-def build_analysis(nets: list[dict[str, Any]]) -> dict[str, Any]:
-    diff_pairs = []
+def extract_ipc2581_nets(root: ET.Element, source_file: str) -> list[dict[str, Any]]:
+    nets = []
+    for n in iter_by_local_name(root, "Net", "ElectricalNet", "LogicalNet"):
+        name = get_attr_any(n, "name", "net", "netname")
+        if not name:
+            continue
+        nodes = []
+        for p in n.iter():
+            if p is n:
+                continue
+            if local_name(p.tag).lower() in {"pin", "pinref", "node", "connection", "connect"}:
+                ref = get_attr_any(p, "refdes", "componentref", "component")
+                pin = get_attr_any(p, "pin", "pinref", "pad", "name")
+                if ref and pin:
+                    nodes.append({"refdes": ref, "pin": pin})
+        nets.append({"name": name, "nodes": nodes, "node_count": len(nodes), "source": {"source_element": local_name(n.tag), "source_file": source_file}})
+    return nets
+
+
+def extract_ipc2581_layers(root: ET.Element) -> list[dict[str, Any]]:
+    layers = []
     seen = set()
-    for n in nets:
-        name = n["name"]
-        if is_diff_pair_member(name) == 1 and name not in seen:
-            partner = find_diff_partner(name)
-            seen.add(name); seen.add(partner)
-            diff_pairs.append({"positive": name, "negative": partner, "interface": guess_diff_interface(name)})
-    return {
-        "power_nets": [n["name"] for n in nets if n.get("is_power")],
-        "ground_nets": [n["name"] for n in nets if n.get("is_ground")],
-        "differential_pairs": diff_pairs,
-        "clock_nets": [n["name"] for n in nets if n.get("is_clock")],
-        "floating_inputs": [],
-        "single_pin_nets": [n["name"] for n in nets if len(n.get("pins", [])) == 1],
-        "adapter_limitations": [
-            "Schematic pin electrical directions are marked UNK because IPC-2581 usually does not preserve schematic symbol electrical types.",
-            "Board geometry/routing extraction is best-effort and depends on Altium IPC-2581 attribute names.",
-        ],
+    for e in iter_by_local_name(root, "Layer", "StackupLayer", "ConductorLayer", "DielectricLayer"):
+        name = get_attr_any(e, "name", "id", "layerref")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        ltype = get_attr_any(e, "type", "layertype", "function", default="unknown")
+        layers.append({"name": name, "type": ltype, "thickness_mm": f_any(e, "thickness", default=0.0)})
+    return layers
+
+
+def extract_ipc2581_stackup(root: ET.Element) -> dict[str, Any]:
+    return {"layers": extract_ipc2581_layers(root)}
+
+
+def extract_ipc2581_placements(root: ET.Element) -> list[dict[str, Any]]:
+    out = []
+    for e in iter_by_local_name(root, "Component", "ComponentInstance", "Placement"):
+        ref = get_attr_any(e, "refdes", "designator", "name")
+        if not ref:
+            continue
+        out.append({"refdes": ref, "x_mm": f_any(e, "x", "xloc"), "y_mm": f_any(e, "y", "yloc"), "rotation": f_any(e, "rotation", "angle")})
+    return out
+
+
+def extract_ipc2581_vias(root: ET.Element) -> list[dict[str, Any]]:
+    return [{"x_mm": f_any(v, "x"), "y_mm": f_any(v, "y"), "drill_mm": f_any(v, "drill", "hole"), "net": get_attr_any(v, "net", "netname", default=None) or None} for v in iter_by_local_name(root, "Via", "BlindVia", "BuriedVia")]
+
+
+def extract_ipc2581_tracks_or_segments(root: ET.Element) -> list[dict[str, Any]]:
+    out = []
+    for t in iter_by_local_name(root, "Segment", "Trace", "Line"):
+        x1, y1, x2, y2 = f_any(t, "x1", "startx"), f_any(t, "y1", "starty"), f_any(t, "x2", "endx"), f_any(t, "y2", "endy")
+        out.append({"x1_mm": x1, "y1_mm": y1, "x2_mm": x2, "y2_mm": y2, "length_mm": math.hypot(x2-x1, y2-y1), "net": get_attr_any(t, "net", "netname", default=None) or None})
+    return out
+
+
+def build_board_export(metadata, components, nets, layers, placements, vias, segments):
+    return {"metadata": metadata, "components": components, "nets": nets, "layers": layers, "placements": placements, "vias": vias, "segments": segments}
+
+
+def build_stack_export(metadata, stackup):
+    return {"metadata": metadata, "stackup": stackup, "layers": stackup.get("layers", [])}
+
+
+def _json_safe(o: Any) -> bool:
+    if isinstance(o, dict):
+        return all(_json_safe(k) and _json_safe(v) for k, v in o.items())
+    if isinstance(o, list):
+        return all(_json_safe(x) for x in o)
+    if isinstance(o, float):
+        return math.isfinite(o)
+    return True
+
+
+def validate_board_export(board: dict[str, Any]) -> list[str]:
+    w = []
+    if not board.get("components"):
+        w.append("board has zero components")
+    if not board.get("nets"):
+        w.append("board has zero nets")
+    if not board.get("layers"):
+        w.append("board has zero layers")
+    known = {c.get("refdes") for c in board.get("components", [])}
+    for p in board.get("placements", []):
+        if p.get("refdes") not in known:
+            w.append(f"placement refdes not in components: {p.get('refdes')}")
+    if not _json_safe(board):
+        w.append("board contains non-JSON-safe values (NaN/Inf)")
+    return w
+
+
+def validate_stack_export(stack: dict[str, Any]) -> list[str]:
+    w = []
+    if not stack.get("layers"):
+        w.append("stack has zero layers")
+    return w
+
+
+def write_outputs(project: str, output: Path, board: dict[str, Any], stack: dict[str, Any], report: dict[str, Any], pretty: bool):
+    output.mkdir(parents=True, exist_ok=True)
+    ind = 2 if pretty else None
+    files = {
+        "board": output / f"{project}-thomson-export-brd.json",
+        "stack": output / f"{project}-thomson-export-stack.json",
+        "report_json": output / f"{project}-conversion-report.json",
+        "report_md": output / f"{project}-conversion-report.md",
     }
+    files["board"].write_text(json.dumps(board, indent=ind), encoding="utf-8")
+    files["stack"].write_text(json.dumps(stack, indent=ind), encoding="utf-8")
+    files["report_json"].write_text(json.dumps(report, indent=ind), encoding="utf-8")
+    files["report_md"].write_text("\n".join(["# IPC-2581 Conversion Report", f"- project: {project}", f"- warnings: {len(report['warnings'])}"]), encoding="utf-8")
+    return files
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("ipc2581", help="Path to IPC-2581 XML file exported from Altium")
-    ap.add_argument("--project", "-p", default=None, help="Project/base name for output files")
-    ap.add_argument("--output", "-o", default="exports", help="Output directory")
+    ap.add_argument("ipc2581")
+    ap.add_argument("--project", required=False)
+    ap.add_argument("--output", default="exports")
+    ap.add_argument("--strict", action="store_true")
+    ap.add_argument("--warnings-as-errors", action="store_true")
+    ap.add_argument("--pretty", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--report-only", action="store_true")
+    ap.add_argument("--inspect", action="store_true")
+    ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
-
-    src = Path(args.ipc2581).expanduser().resolve()
-    out_dir = Path(args.output).expanduser().resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    project = args.project or src.stem
-
+    src = Path(args.ipc2581)
+    if not src.exists():
+        print("ERROR: IPC-2581 file missing", file=sys.stderr); return 2
+    if src.stat().st_size == 0:
+        print("ERROR: IPC-2581 file is empty", file=sys.stderr); return 2
     try:
-        tree = ET.parse(src)
+        root = parse_ipc2581(src)
     except ET.ParseError as e:
-        print(f"ERROR: failed to parse XML: {e}", file=sys.stderr)
-        return 2
-    root = tree.getroot()
-
-    export_date = datetime.now(timezone.utc).isoformat()
-    components = parse_components(root)
-    nets, net_pins = parse_nets_and_pins(root)
-    attach_pads_from_net_pins(components, net_pins)
-    layers = parse_layers(root)
-    outline = parse_outline(root)
-    net_names = {n["name"] for n in nets}
-    segments, vias = parse_traces_and_vias(root, net_names)
-
-    sch_json = {
-        "thomsonlint_version": VERSION,
-        "export_date": export_date,
-        "mode": "schematic",
-        "project": {"name": project, "variant": "", "sheets_count": 0, "source_format": "IPC-2581"},
-        "components": [
-            {k: v for k, v in c.items() if k not in {"x_mm", "y_mm", "rotation", "side", "pads"}}
-            for c in sorted(components.values(), key=lambda x: x["ref"])
-        ],
-        "nets": nets,
-        "analysis": build_analysis(nets),
-    }
-
-    board_components = []
-    for c in sorted(components.values(), key=lambda x: x["ref"]):
-        board_components.append({
-            "ref": c["ref"], "package": c.get("package", ""), "value": c.get("value", ""),
-            "x_mm": c.get("x_mm", 0.0), "y_mm": c.get("y_mm", 0.0),
-            "rotation": c.get("rotation", 0.0), "side": c.get("side", "top"),
-            "pads": [{"name": p.get("name", ""), "x_mm": p.get("x_mm", 0.0), "y_mm": p.get("y_mm", 0.0)} for p in c.get("pads", [])],
-        })
-
-    brd_json = {
-        "thomsonlint_version": VERSION,
-        "export_date": export_date,
-        "mode": "board",
-        "components": board_components,
-        "board": {
-            "area": {
-                "width_mm": outline["width_mm"] if outline else 0,
-                "height_mm": outline["height_mm"] if outline else 0,
-                "x1_mm": round(outline["x1"], 4) if outline else 0,
-                "y1_mm": round(outline["y1"], 4) if outline else 0,
-                "x2_mm": round(outline["x2"], 4) if outline else 0,
-                "y2_mm": round(outline["y2"], 4) if outline else 0,
-            },
-            "layers_used": [{"number": l["number"], "name": l["name"]} for l in layers if l.get("is_copper")],
-            "layer_count": len([l for l in layers if l.get("is_copper")]),
-            "holes": [],
-            "polygons": [],
-        },
-        "signals": signal_stats(nets, segments, vias),
-        "analysis": {
-            "component_edge_distances": [],
-            "decoupling_proximity": [],
-            "ground_plane_layers": [l["name"] for l in layers if "gnd" in l["name"].lower() or "ground" in l["name"].lower()],
-            "adapter_limitations": [
-                "Component edge distances and decoupling proximity need reliable placement/pad coordinates from the IPC-2581 export; verify before relying on them.",
-                "If routing segments are empty, the Altium IPC-2581 geometry tags need a project-specific extraction rule.",
-            ],
-        },
-    }
-
-    stack_json = {
-        "thomsonlint_version": VERSION,
-        "export_date": export_date,
-        "mode": "stackup",
-        "project": {"name": project, "source_format": "IPC-2581"},
-        "layers": layers,
-        "copper_layers": [l for l in layers if l.get("is_copper")],
-    }
-
-    paths = {
-        "schematic": out_dir / f"{project}-thomson-export-sch.json",
-        "board": out_dir / f"{project}-thomson-export-brd.json",
-        "stack": out_dir / f"{project}-thomson-export-stack.json",
-    }
-    paths["schematic"].write_text(json.dumps(sch_json, indent=2, ensure_ascii=False), encoding="utf-8")
-    paths["board"].write_text(json.dumps(brd_json, indent=2, ensure_ascii=False), encoding="utf-8")
-    paths["stack"].write_text(json.dumps(stack_json, indent=2, ensure_ascii=False), encoding="utf-8")
-
-    print(f"Wrote {paths['schematic']}")
-    print(f"Wrote {paths['board']}")
-    print(f"Wrote {paths['stack']}")
-    print(f"Summary: components={len(components)} nets={len(nets)} layers={len(layers)} segments={len(segments)} vias={len(vias)}")
-    if len(nets) == 0:
-        print("WARNING: no nets found. The parser likely needs tag/attribute tuning for this Altium IPC-2581 export.", file=sys.stderr)
-    if len(components) == 0:
-        print("WARNING: no components found. The parser likely needs tag/attribute tuning for this Altium IPC-2581 export.", file=sys.stderr)
+        print(f"ERROR: failed to parse XML: {e}", file=sys.stderr); return 2
+    if args.inspect:
+        tags = sorted({local_name(e.tag) for e in root.iter()})
+        print("Discovered tags:", ", ".join(tags[:100]))
+    project = args.project or src.stem
+    metadata = extract_ipc2581_metadata(root, str(src), project)
+    components = extract_ipc2581_components(root, str(src))
+    nets = extract_ipc2581_nets(root, str(src))
+    layers = extract_ipc2581_layers(root)
+    stackup = extract_ipc2581_stackup(root)
+    placements = extract_ipc2581_placements(root)
+    vias = extract_ipc2581_vias(root)
+    segments = extract_ipc2581_tracks_or_segments(root)
+    board = build_board_export(metadata, components, nets, layers, placements, vias, segments)
+    stack = build_stack_export(metadata, stackup)
+    warnings = validate_board_export(board) + validate_stack_export(stack)
+    report = {"metadata": metadata, "inputs": {"ipc2581": str(src)}, "counts": {"board_components": len(components), "board_nets": len(nets), "layers": len(layers), "placements": len(placements), "tracks_segments": len(segments), "vias": len(vias), "drills": len([v for v in vias if v.get('drill_mm')])}, "warnings": warnings, "errors": [], "unsupported_features": ["schematic-derived intent from IPC-2581 not available"], "validation": {"best_effort_thomsonlint_contract": True}}
+    if not args.dry_run and not args.report_only:
+        write_outputs(project, Path(args.output), board, stack, report, args.pretty)
+    elif not args.dry_run and args.report_only:
+        write_outputs(project, Path(args.output), {}, {}, report, args.pretty)
+    if warnings:
+        for w in warnings: print(f"WARNING: {w}", file=sys.stderr)
+    if args.warnings_as_errors and warnings:
+        return 1
+    if args.strict and any(x in warnings for x in ["board has zero components", "board has zero nets", "board has zero layers"]):
+        return 1
     return 0
 
 
