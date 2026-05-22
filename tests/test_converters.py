@@ -64,3 +64,98 @@ def test_all(tmp_path):
     assert (out/"bun-thomson-export-brd.json").exists()
     assert (out/"bun-thomson-export-stack.json").exists()
     assert (out/"bun-bundle-conversion-report.json").exists()
+
+
+def test_phase1_bundle_converter_discovery_and_dryrun(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    proj = tmp_path/"proj"
+    (proj/"pre_conversion"/"schematic").mkdir(parents=True)
+    (proj/"pre_conversion"/"layout").mkdir(parents=True)
+    (proj/"pre_conversion"/"schematic"/"n.asc").write_text("*PADS-PCB*\n")
+    (proj/"pre_conversion"/"schematic"/"bom.csv").write_text("A,B\n1,2\n")
+    (proj/"pre_conversion"/"schematic"/"sch.pdf").write_text("pdf")
+    (proj/"pre_conversion"/"layout"/"board.xml").write_text("<IPC-2581/>")
+    (proj/"pre_conversion"/"layout"/"fab.pdf").write_text("pdf")
+
+    out = tmp_path/"out"
+    r = run(["python3","thomson_bundle_converter.py",str(proj),"--output-root",str(out),"--dry-run","--report-only"], root)
+    assert r.returncode == 0
+    assert not out.exists()
+
+    r2 = run(["python3","thomson_bundle_converter.py",str(proj),"--output-root",str(out),"--pretty"], root)
+    assert r2.returncode == 0
+    report = json.loads((out/"proj-conversion-report.json").read_text())
+    cats = report["discovery"]["counts_by_category"]
+    assert cats["pads_ascii_candidate"] == 1
+    assert cats["bom_csv_candidate"] == 1
+    assert cats["schematic_pdf_candidate"] == 1
+    assert cats["ipc2581_candidate"] == 1
+    assert cats["layout_pdf_candidate"] == 1
+
+
+def test_phase1_examples_compat_mode(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    proj = tmp_path/"examples"
+    proj.mkdir()
+    (proj/"example_pads.asc").write_text("*PADS-PCB*\n")
+    (proj/"example_bom.csv").write_text("A,B\n1,2\n")
+    (proj/"example_ipc.xml").write_text("<IPC-2581/>")
+    (proj/"example_schematic.pdf").write_text("pdf")
+    (proj/"example_gerbers.pdf").write_text("pdf")
+
+    out = tmp_path/"o2"
+    r = run(["python3","thomson_bundle_converter.py",str(proj),"--output-root",str(out),"--pretty"], root)
+    assert r.returncode == 0
+    report = json.loads((out/"examples-conversion-report.json").read_text())
+    warn_codes = {w["code"] for w in report["warnings"]}
+    assert "WARN_EXAMPLES_FLAT_LAYOUT" in warn_codes
+    cats = report["discovery"]["counts_by_category"]
+    assert cats["pads_ascii_candidate"] == 1
+    assert cats["bom_csv_candidate"] == 1
+    assert cats["ipc2581_candidate"] == 1
+    assert cats.get("schematic_pdf_candidate", 0) + cats.get("layout_pdf_candidate", 0) == 2
+
+def test_phase2_bom_simple_and_multi_refdes(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    proj = tmp_path / "proj"
+    (proj / "pre_conversion" / "schematic").mkdir(parents=True)
+    (proj / "pre_conversion" / "layout").mkdir(parents=True)
+    (proj / "pre_conversion" / "schematic" / "bom.csv").write_text(
+        "Designator,Value,Qty,DNP\nR1 R2,10k,2,No\nC1-C3,100n,3,Yes\n"
+    )
+    out = tmp_path / "out"
+    r = run(["python3", "thomson_bundle_converter.py", str(proj), "--output-root", str(out), "--pretty"], root)
+    assert r.returncode == 0
+    bom = json.loads((out / "proj-bom.json").read_text())
+    assert bom["row_count"] == 2
+    assert bom["expanded_refdes_count"] == 5
+    assert bom["items"][0]["fields"]["dnp"] is False
+    assert bom["items"][1]["fields"]["dnp"] is True
+
+
+def test_phase2_bom_duplicate_refdes(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    proj = tmp_path / "proj"
+    (proj / "pre_conversion" / "schematic").mkdir(parents=True)
+    (proj / "pre_conversion" / "layout").mkdir(parents=True)
+    (proj / "pre_conversion" / "schematic" / "bom.csv").write_text(
+        "RefDes,Description\nU1,MCU\nU1,MCU2\n"
+    )
+    out = tmp_path / "out"
+    r = run(["python3", "thomson_bundle_converter.py", str(proj), "--output-root", str(out)], root)
+    assert r.returncode == 0
+    bom = json.loads((out / "proj-bom.json").read_text())
+    assert "U1" in bom["duplicate_refdes"]
+
+
+def test_phase2_bom_real_examples_smoke_if_present(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    examples = root / "examples"
+    if not examples.exists():
+        return
+    out = tmp_path / "out"
+    r = run(["python3", "thomson_bundle_converter.py", str(examples), "--project-name", "example", "--output-root", str(out), "--pretty"], root)
+    assert r.returncode == 0
+    assert (out / "example-bom.json").exists()
+    report = json.loads((out / "example-conversion-report.json").read_text())
+    assert "bom" in report
