@@ -32,6 +32,7 @@ def test_all(tmp_path):
     sch = json.loads((out/"t1-thomson-export-sch.json").read_text())
     assert len(sch["components"]) >= 2 and len(sch["nets"]) >= 2
 
+    (tmp_path/"empty.asc").write_text("")
     r = run(["python3","pads_ascii_to_thomson_sch.py","--netlist",str(tmp_path/"empty.asc"),"--project","e","--output",str(out)], root)
     assert r.returncode != 0
 
@@ -50,6 +51,8 @@ def test_all(tmp_path):
     dry = tmp_path/"dry"; dry.mkdir()
     r = run(["python3","ipc2581_to_thomson.py",str(xml),"--project","dry","--output",str(dry),"--dry-run"], root)
     assert r.returncode == 0 and not (dry/"dry-thomson-export-brd.json").exists()
+    r = run(["python3","altium_orcad_to_thomson_bundle.py","--bundle",str(tmp_path/"bundle_missing"),"--project","bdry","--output",str(tmp_path/"dry2"),"--dry-run"], root)
+    assert r.returncode == 0 and not (tmp_path/"dry2").exists()
 
     bundle = tmp_path/"bundle"; (bundle/"schematic").mkdir(parents=True); (bundle/"layout").mkdir(parents=True)
     (bundle/"schematic/pads_netlist.asc").write_text(PADS)

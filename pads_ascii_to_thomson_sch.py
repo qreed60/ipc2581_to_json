@@ -109,6 +109,8 @@ def main():
     args = ap.parse_args()
     net = Path(args.netlist)
     if not net.exists(): print("ERROR: netlist missing", file=sys.stderr); return 2
+    if net.stat().st_size == 0:
+        print("ERROR: netlist is empty", file=sys.stderr); return 2
     components, nets, warnings, unsupported = parse_pads_ascii(net)
     if args.inspect: print(f"Inspect: components={len(components)} nets={len(nets)}")
     bom_rows = []
@@ -127,12 +129,15 @@ def main():
         if n["node_count"] == 1: warnings.append(f"single-node net: {n['name']}")
     export = {"metadata": {"project": args.project, "source_format": "pads_ascii_netlist", "source_files": {"netlist": str(net), "bom": args.bom, "erc": args.erc}, "converter": VERSION, "conversion_timestamp": now_iso(), "warnings": warnings, "limitations": ["PADS ASCII netlist provides connectivity, not full schematic semantics."]}, "components": list(components.values()), "nets": net_list, "erc": {"source_file": args.erc, "text": Path(args.erc).read_text(encoding='utf-8', errors='ignore') if args.erc and Path(args.erc).exists() else None, "parsed_findings": []}, "analysis": {"schematic_only_fields_missing": ["pin_electrical_type","symbol_graphics","sheet_hierarchy","ERC_semantics"]}}
     report = {"inputs": {"netlist": str(net), "bom": args.bom}, "counts": {"schematic_components": len(components), "schematic_nets": len(net_list), "schematic_pins_nodes": pin_count, "bom_rows": len(bom_rows)}, "warnings": warnings, "errors": [], "unsupported_features": unsupported}
-    out = Path(args.output); out.mkdir(parents=True, exist_ok=True)
+    out = Path(args.output)
+    if not args.dry_run:
+        out.mkdir(parents=True, exist_ok=True)
     ind=2 if args.pretty else None
     if not args.dry_run and not args.report_only:
         (out / f"{args.project}-thomson-export-sch.json").write_text(json.dumps(export, indent=ind), encoding="utf-8")
-    (out / f"{args.project}-conversion-report.json").write_text(json.dumps(report, indent=ind), encoding="utf-8")
-    (out / f"{args.project}-conversion-report.md").write_text("# PADS Conversion Report\n", encoding="utf-8")
+    if not args.dry_run:
+        (out / f"{args.project}-conversion-report.json").write_text(json.dumps(report, indent=ind), encoding="utf-8")
+        (out / f"{args.project}-conversion-report.md").write_text("# PADS Conversion Report\n", encoding="utf-8")
     if args.warnings_as_errors and warnings: return 1
     if args.strict and any(w.startswith("zero ") for w in warnings): return 1
     return 0

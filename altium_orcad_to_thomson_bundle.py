@@ -22,14 +22,19 @@ def main():
     pads=Path(args.pads_netlist) if args.pads_netlist else (bundle/"schematic/pads_netlist.asc" if bundle else None)
     bom=Path(args.bom) if args.bom else (bundle/"schematic/bom.csv" if bundle else None)
     ipc=Path(args.ipc2581) if args.ipc2581 else (bundle/"layout/ipc2581.xml" if bundle else None)
-    out=Path(args.output); out.mkdir(parents=True, exist_ok=True)
+    out=Path(args.output)
+    if not args.dry_run:
+        out.mkdir(parents=True, exist_ok=True)
     warnings=[]; outputs=[]
     if pads and pads.exists():
         cmd=["python3","pads_ascii_to_thomson_sch.py","--netlist",str(pads),"--project",args.project,"--output",str(out)]
         if bom and bom.exists(): cmd += ["--bom",str(bom)]
         if args.pretty: cmd.append("--pretty")
         if args.strict: cmd.append("--strict")
-        rc=subprocess.run(cmd).returncode
+        if args.dry_run:
+            rc = 0
+        else:
+            rc=subprocess.run(cmd).returncode
         if rc!=0: warnings.append(f"schematic converter exit code {rc}")
         outputs.append(str(out/f"{args.project}-thomson-export-sch.json"))
     else: warnings.append("missing required schematic netlist")
@@ -37,15 +42,19 @@ def main():
         cmd=["python3","ipc2581_to_thomson.py",str(ipc),"--project",args.project,"--output",str(out)]
         if args.pretty: cmd.append("--pretty")
         if args.strict: cmd.append("--strict")
-        rc=subprocess.run(cmd).returncode
+        if args.dry_run:
+            rc = 0
+        else:
+            rc=subprocess.run(cmd).returncode
         if rc!=0: warnings.append(f"board converter exit code {rc}")
         outputs += [str(out/f"{args.project}-thomson-export-brd.json"), str(out/f"{args.project}-thomson-export-stack.json")]
     else: warnings.append("missing required ipc2581")
     d356=parse_ipc_d_356a(args.ipc_d_356a)
     report={"project":args.project,"timestamp":now_iso(),"inputs":{"bundle":args.bundle,"pads_netlist":str(pads) if pads else None,"bom":str(bom) if bom else None,"ipc2581":str(ipc) if ipc else None},"output_files":outputs,"warnings":warnings,"ipc_d_356a":d356}
     ind=2 if args.pretty else None
-    (out/f"{args.project}-bundle-conversion-report.json").write_text(json.dumps(report, indent=ind), encoding="utf-8")
-    (out/f"{args.project}-bundle-conversion-report.md").write_text("# Bundle Conversion Report\n", encoding="utf-8")
+    if not args.dry_run:
+        (out/f"{args.project}-bundle-conversion-report.json").write_text(json.dumps(report, indent=ind), encoding="utf-8")
+        (out/f"{args.project}-bundle-conversion-report.md").write_text("# Bundle Conversion Report\n", encoding="utf-8")
     if args.warnings_as_errors and warnings: return 1
     if args.strict and ("missing required schematic netlist" in warnings or "missing required ipc2581" in warnings): return 1
     return 0

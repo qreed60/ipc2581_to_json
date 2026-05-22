@@ -2,7 +2,7 @@
 
 ## ThomsonLint field expectations
 
-No ThomsonLint repository, schema, or sample exports were present in this workspace during this implementation pass, so compatibility checks are best-effort and contract-based.
+No ThomsonLint repository, schema, or sample exports were present in this workspace during this implementation pass, including no local `tools/kicad-export.py`, so compatibility checks are best-effort and contract-based.
 
 ### Confirmed (from existing local converter conventions)
 - Schematic file naming: `<project>-thomson-export-sch.json`.

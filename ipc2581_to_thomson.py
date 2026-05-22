@@ -228,6 +228,8 @@ def main() -> int:
     src = Path(args.ipc2581)
     if not src.exists():
         print("ERROR: IPC-2581 file missing", file=sys.stderr); return 2
+    if src.stat().st_size == 0:
+        print("ERROR: IPC-2581 file is empty", file=sys.stderr); return 2
     try:
         root = parse_ipc2581(src)
     except ET.ParseError as e:
