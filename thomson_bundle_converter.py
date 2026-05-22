@@ -448,7 +448,13 @@ def parse_ipc2581(project_root: Path, files: list[ClassifiedFile]) -> dict[str, 
     ns = root.tag.split('}')[0].strip('{') if root.tag.startswith('{') else None
     ipc_root=_local(root.tag)
     rev=root.attrib.get('revision') or root.attrib.get('Revision')
-    units=None
+    units = root.attrib.get("units") or root.attrib.get("unit")
+    if units is None:
+        for tag_name in ("CadHeader", "Step", "CadData", "Content"):
+            node = next((e for e in root.iter() if _local(e.tag) == tag_name and (e.attrib.get("units") or e.attrib.get("unit"))), None)
+            if node is not None:
+                units = node.attrib.get("units") or node.attrib.get("unit")
+                break
 
     layers=[]; layer_by_name={}
     for e in root.iter():
@@ -526,13 +532,37 @@ def parse_ipc2581(project_root: Path, files: list[ClassifiedFile]) -> dict[str, 
                 stack.append({"name":name,"sequence":e.attrib.get('sequence') or e.attrib.get('order'),"material":e.attrib.get('material'),"thickness":e.attrib.get('thickness'),"dielectric_constant":e.attrib.get('er') or e.attrib.get('epsilonR'),"copper_thickness":e.attrib.get('copperThickness')})
 
     vias=[]; drills=[]; routes=[]; outline=[]
+    # Strict board profile extraction only: Profile -> Polygon -> PolyBegin/PolyStepSegment
+    profile_nodes = [e for e in root.iter() if _local(e.tag) == "Profile"]
+    if profile_nodes:
+        profile = profile_nodes[0]
+        for poly in [e for e in profile if _local(e.tag) == "Polygon"]:
+            for p in poly:
+                if _local(p.tag) in {"PolyBegin", "PolyStepSegment"} and "x" in p.attrib and "y" in p.attrib:
+                    outline.append({"x": p.attrib.get("x"), "y": p.attrib.get("y")})
     for e in root.iter():
         t=_local(e.tag)
-        if t=="Via": vias.append({"x":e.attrib.get('x'),"y":e.attrib.get('y'),"drill":e.attrib.get('drill')})
-        elif t in {"Drill","Hole"}: drills.append({"x":e.attrib.get('x'),"y":e.attrib.get('y'),"diameter":e.attrib.get('diameter') or e.attrib.get('drill')})
-        elif t in {"Segment","Trace","Line"}: routes.append({"x1":e.attrib.get('x1'),"y1":e.attrib.get('y1'),"x2":e.attrib.get('x2'),"y2":e.attrib.get('y2'),"net":e.attrib.get('net') or e.attrib.get('netRef')})
-        elif t in {"Profile","Outline","Contour","Polygon","Point","PolyBegin","PolyStepSegment"}:
-            if 'x' in e.attrib and 'y' in e.attrib: outline.append({"x":e.attrib.get('x'),"y":e.attrib.get('y')})
+        if t == "Via":
+            vias.append({"x":e.attrib.get('x'),"y":e.attrib.get('y'),"drill":e.attrib.get('drill'),"plated":e.attrib.get("plated"),"via":True})
+        elif t in {"Drill","Hole"}:
+            plating_status = e.attrib.get("platingStatus") or e.attrib.get("plating_status") or e.attrib.get("plated")
+            drill_rec = {
+                "name": e.attrib.get("name"),
+                "x": e.attrib.get('x'),
+                "y": e.attrib.get('y'),
+                "diameter": e.attrib.get('diameter') or e.attrib.get('drill'),
+                "platingStatus": plating_status,
+                "plusTol": e.attrib.get("plusTol"),
+                "minusTol": e.attrib.get("minusTol"),
+                "layerSpan": e.attrib.get("layerSpan") or e.attrib.get("fromLayer") or e.attrib.get("toLayer"),
+            }
+            drills.append(drill_rec)
+            if (plating_status or "").upper() == "VIA":
+                vias.append({"x": drill_rec["x"], "y": drill_rec["y"], "drill": drill_rec["diameter"], "platingStatus": plating_status, "via": True, "name": drill_rec["name"]})
+        elif t in {"Segment","Trace","Line"}:
+            x1, y1, x2, y2 = e.attrib.get('x1'), e.attrib.get('y1'), e.attrib.get('x2'), e.attrib.get('y2')
+            if x1 is not None and y1 is not None and x2 is not None and y2 is not None:
+                routes.append({"x1":x1,"y1":y1,"x2":x2,"y2":y2,"net":e.attrib.get('net') or e.attrib.get('netRef'),"layerRef":e.attrib.get("layerRef")})
 
     if not stack:
         for l in layers:
@@ -540,13 +570,17 @@ def parse_ipc2581(project_root: Path, files: list[ClassifiedFile]) -> dict[str, 
         warnings.append({"code":"WARN_IPC_STACKUP_UNAVAILABLE","message":"Material/thickness stackup details unavailable; using known ordered layer metadata."})
     if not layers: warnings.append({"code":"WARN_IPC_LAYERS_UNAVAILABLE","message":"No layers extracted from IPC file."})
 
-    counts={"board_component_count":len(components),"placement_count":len(components),"placements_with_xy_count":sum(1 for c in components if c.get("x") is not None and c.get("y") is not None),"board_net_count":len(nets),"logical_net_count":len(nets),"physical_net_count":len(physical_nets),"phy_net_point_count":phy_point_count,"layer_count":len(layers),"stackup_layer_count":len(stack),"via_count":len(vias),"drill_count":len(drills),"route_segment_count":len(routes),"outline_point_count":len(outline)}
-    analysis={"layer_count":len(layers),"layers_used":[l['name'] for l in layers],"ground_plane_layers":[l['name'] for l in layers if l['name'] and 'gnd' in l['name'].lower()],"signal_layers":[l['name'] for l in layers if l.get('type') and 'signal' in (l.get('type') or '').lower()]}
+    plated_hole_count = sum(1 for d in drills if (d.get("platingStatus") or "").upper() == "PLATED")
+    nonplated_hole_count = sum(1 for d in drills if (d.get("platingStatus") or "").upper() == "NONPLATED")
+    counts={"board_component_count":len(components),"placement_count":len(components),"placements_with_xy_count":sum(1 for c in components if c.get("x") is not None and c.get("y") is not None),"board_net_count":len(nets),"logical_net_count":len(nets),"physical_net_count":len(physical_nets),"phy_net_point_count":phy_point_count,"layer_count":len(layers),"stackup_layer_count":len(stack),"hole_count":len(drills),"via_count":len(vias),"plated_hole_count":plated_hole_count,"nonplated_hole_count":nonplated_hole_count,"drills_with_plating_status_count":sum(1 for d in drills if d.get("platingStatus")),"drill_count":len(drills),"route_segment_count":len(routes),"outline_point_count":len(outline)}
+    def _norm_layer(v: str | None) -> str:
+        return (v or "").upper()
+    analysis={"layer_count":len(layers),"layers_used":[l['name'] for l in layers],"ground_plane_layers":[l['name'] for l in layers if _norm_layer(l.get('function') or l.get('type')) in {"PLANE", "GROUND"} or ('GND' in (l['name'] or '').upper())],"signal_layers":[l['name'] for l in layers if _norm_layer(l.get('function') or l.get('type')) in {"CONDUCTOR", "SIGNAL", "INTERNAL"}]}
     return {"source_file":src.relative_path,"parser_version":IPC_PARSER_VERSION,"ipc_root":ipc_root,"ipc_revision":rev,"namespace":ns,"units":units,"components":components,"nets":nets,"physical_nets":physical_nets,"layers":layers,"stackup_layers":stack,"outline":outline,"vias":vias,"drills":drills,"route_segments":routes,"analysis":analysis,"warnings":warnings,"extraction_counts":counts}
 
 
 def build_board_export(project_name:str, project_root:Path, ipc:dict[str,Any])->dict[str,Any]:
-    return {"project_name":project_name,"source":{"project_root":str(project_root),"layout_file":ipc.get('source_file'),"format":"ipc2581","ipc_root":ipc.get('ipc_root'),"ipc_revision":ipc.get('ipc_revision'),"namespace":ipc.get('namespace')},"parser_version":ipc.get('parser_version'),"components":ipc.get('components',[]),"placements":ipc.get('components',[]),"nets":ipc.get('nets',[]),"physical_nets":ipc.get('physical_nets',[]),"layers":ipc.get('layers',[]),"board_outline":ipc.get('outline',[]),"vias":ipc.get('vias',[]),"drills":ipc.get('drills',[]),"routes":ipc.get('route_segments',[]),"analysis":ipc.get('analysis',{}),"warnings":ipc.get('warnings',[]),"extraction_counts":ipc.get('extraction_counts',{})}
+    return {"project_name":project_name,"source":{"project_root":str(project_root),"layout_file":ipc.get('source_file'),"format":"ipc2581","ipc_root":ipc.get('ipc_root'),"ipc_revision":ipc.get('ipc_revision'),"namespace":ipc.get('namespace'),"units":ipc.get('units')},"units":ipc.get("units"),"parser_version":ipc.get('parser_version'),"components":ipc.get('components',[]),"placements":ipc.get('components',[]),"nets":ipc.get('nets',[]),"physical_nets":ipc.get('physical_nets',[]),"layers":ipc.get('layers',[]),"board_outline":ipc.get('outline',[]),"vias":ipc.get('vias',[]),"drills":ipc.get('drills',[]),"routes":ipc.get('route_segments',[]),"analysis":ipc.get('analysis',{}),"warnings":ipc.get('warnings',[]),"extraction_counts":ipc.get('extraction_counts',{})}
 
 
 def build_stack_export(project_name:str, project_root:Path, ipc:dict[str,Any])->dict[str,Any]:
