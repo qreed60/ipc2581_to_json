@@ -159,3 +159,52 @@ def test_phase2_bom_real_examples_smoke_if_present(tmp_path):
     assert (out / "example-bom.json").exists()
     report = json.loads((out / "example-conversion-report.json").read_text())
     assert "bom" in report
+
+def test_phase3_pads_parse_and_bom_merge(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    proj = tmp_path / "proj"
+    (proj / "pre_conversion" / "schematic").mkdir(parents=True)
+    (proj / "pre_conversion" / "layout").mkdir(parents=True)
+    (proj / "pre_conversion" / "schematic" / "net.asc").write_text(
+        "*PADS-PCB*\n*PART*\nCOMP U1 value=MCU footprint=QFN48\nCOMP R1 value=10k footprint=0402\n*NET*\nNET GND\nU1.1\nR1.1\nNET SIG\nU1.2\nR1.2\n"
+    )
+    (proj / "pre_conversion" / "schematic" / "bom.csv").write_text(
+        "RefDes,Value,Footprint,Description\nU1,MCU,QFN48,Controller\nR1,10k,0402,Resistor\n"
+    )
+    out = tmp_path / "out"
+    r = run(["python3", "thomson_bundle_converter.py", str(proj), "--output-root", str(out), "--pretty"], root)
+    assert r.returncode == 0
+    sch = json.loads((out / "proj-thomson-export-sch.json").read_text())
+    assert len(sch["components"]) == 2
+    assert len(sch["nets"]) == 2
+    assert sch["bom_merge"]["components_with_bom_metadata"] == 2
+
+
+def test_phase3_pads_value_mismatch_warning(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    proj = tmp_path / "proj"
+    (proj / "pre_conversion" / "schematic").mkdir(parents=True)
+    (proj / "pre_conversion" / "layout").mkdir(parents=True)
+    (proj / "pre_conversion" / "schematic" / "net.asc").write_text(
+        "*PADS-PCB*\n*PART*\nCOMP U1 value=A footprint=QFN48\n*NET*\nNET G\nU1.1\n"
+    )
+    (proj / "pre_conversion" / "schematic" / "bom.csv").write_text("RefDes,Value\nU1,B\n")
+    out = tmp_path / "out"
+    r = run(["python3", "thomson_bundle_converter.py", str(proj), "--output-root", str(out)], root)
+    assert r.returncode == 0
+    report = json.loads((out / "proj-conversion-report.json").read_text())
+    codes = {w["code"] for w in report["warnings"]}
+    assert "WARN_COMPONENT_VALUE_MISMATCH" in codes
+
+
+def test_phase3_real_examples_smoke_if_present(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    examples = root / "examples"
+    if not examples.exists():
+        return
+    out = tmp_path / "out"
+    r = run(["python3", "thomson_bundle_converter.py", str(examples), "--project-name", "example", "--output-root", str(out), "--pretty"], root)
+    assert r.returncode == 0
+    assert (out / "example-thomson-export-sch.json").exists()
+    sch = json.loads((out / "example-thomson-export-sch.json").read_text())
+    assert "components" in sch and "nets" in sch

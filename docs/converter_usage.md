@@ -34,3 +34,15 @@ python3 thomson_bundle_converter.py examples --dry-run --report-only
 Notes:
 - Phase 2 adds BOM CSV parsing and writes `<project>-bom.json` in non-dry-run, non-report-only mode.
 - Phase 2 does not yet implement PADS/IPC/PDF deep conversion outputs.
+
+## Phase 3 schematic parser integration
+
+```bash
+python3 thomson_bundle_converter.py examples --project-name example --pretty
+python3 thomson_bundle_converter.py examples --project-name example --pretty --strict
+python3 thomson_bundle_converter.py examples --dry-run --report-only
+```
+
+Notes:
+- Phase 3 adds PADS ASCII schematic extraction and writes `<project>-thomson-export-sch.json` in non-dry-run, non-report-only mode.
+- BOM metadata is merged into matching schematic components by refdes.
