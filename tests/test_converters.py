@@ -208,3 +208,33 @@ def test_phase3_real_examples_smoke_if_present(tmp_path):
     assert (out / "example-thomson-export-sch.json").exists()
     sch = json.loads((out / "example-thomson-export-sch.json").read_text())
     assert "components" in sch and "nets" in sch
+
+def test_phase4_ipc_minimal_and_namespace(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    proj = tmp_path / "proj"
+    (proj / "pre_conversion" / "schematic").mkdir(parents=True)
+    (proj / "pre_conversion" / "layout").mkdir(parents=True)
+    (proj / "pre_conversion" / "schematic" / "bom.csv").write_text("RefDes,Value\nU1,MCU\n")
+    (proj / "pre_conversion" / "schematic" / "net.asc").write_text("*PADS-PCB*\n*PART*\nCOMP U1 value=MCU footprint=QFN\n*NET*\nNET GND\nU1.1\n")
+    (proj / "pre_conversion" / "layout" / "board.xml").write_text("""<ns:IPC-2581 xmlns:ns='urn:test' revision='B'><ns:Layer name='L1' layerFunction='signal'/><ns:Component refDes='U1' x='1' y='2' layerRef='L1'/><ns:Net name='GND'><ns:PinRef componentRef='U1' pin='1'/></ns:Net><ns:Via x='1' y='1' drill='0.2'/><ns:Segment x1='0' y1='0' x2='1' y2='1' net='GND'/></ns:IPC-2581>""")
+    out = tmp_path / "out"
+    r = run(["python3", "thomson_bundle_converter.py", str(proj), "--output-root", str(out)], root)
+    assert r.returncode == 0
+    brd = json.loads((out / "proj-thomson-export-brd.json").read_text())
+    stk = json.loads((out / "proj-thomson-export-stack.json").read_text())
+    assert brd["source"]["ipc_root"] == "IPC-2581"
+    assert len(brd["components"]) == 1
+    assert len(brd["layers"]) >= 1
+    assert "layer_stack" in stk
+
+
+def test_phase4_real_examples_ipc_smoke_if_present(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    examples = root / "examples"
+    if not examples.exists():
+        return
+    out = tmp_path / "out"
+    r = run(["python3", "thomson_bundle_converter.py", str(examples), "--project-name", "example", "--output-root", str(out), "--pretty"], root)
+    assert r.returncode == 0
+    assert (out / "example-thomson-export-brd.json").exists()
+    assert (out / "example-thomson-export-stack.json").exists()

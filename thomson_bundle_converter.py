@@ -7,14 +7,16 @@ import csv
 import io
 import json
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.3.0-phase3"
+VERSION = "0.4.0-phase4"
 BOM_PARSER_VERSION = "bom-v1"
 PADS_PARSER_VERSION = "pads-v1"
+IPC_PARSER_VERSION = "ipc2581-v1"
 
 
 @dataclass
@@ -74,7 +76,7 @@ def classify_file(path: Path, root: Path, role_hint: str) -> ClassifiedFile:
         return ClassifiedFile(rel, ext, size, "pads_ascii_candidate", "medium", "Extension is compatible with PADS ASCII export")
     if ext == ".csv" and role_hint == "schematic":
         return ClassifiedFile(rel, ext, size, "bom_csv_candidate", "high", "CSV in schematic scope likely BOM")
-    if ext in {".xml", ".ipc2581"} and role_hint == "layout":
+    if ext in {".xml", ".ipc2581", ".cvg", ".ipc"} and role_hint == "layout":
         return ClassifiedFile(rel, ext, size, "ipc2581_candidate", "high", "Layout XML/IPC2581 extension")
     if ext == ".pdf" and role_hint == "schematic":
         return ClassifiedFile(rel, ext, size, "schematic_pdf_candidate", "high", "PDF under schematic scope")
@@ -82,7 +84,7 @@ def classify_file(path: Path, root: Path, role_hint: str) -> ClassifiedFile:
         return ClassifiedFile(rel, ext, size, "layout_pdf_candidate", "high", "PDF under layout scope")
     if ext == ".csv":
         return ClassifiedFile(rel, ext, size, "bom_csv_candidate", "medium", "CSV found outside schematic scope; treated as BOM candidate")
-    if ext in {".xml", ".ipc2581"}:
+    if ext in {".xml", ".ipc2581", ".cvg", ".ipc"}:
         return ClassifiedFile(rel, ext, size, "ipc2581_candidate", "medium", "XML/IPC2581 found outside layout scope")
     if ext == ".pdf":
         if "schem" in name:
@@ -370,7 +372,99 @@ def build_schematic_export(project_name: str, project_root: Path, pads: dict[str
     }
 
 
-def build_report(args: argparse.Namespace, project_root: Path, output_root: Path, project_name: str, files: list[ClassifiedFile], warnings: list[dict[str, Any]], bom: dict[str, Any], pads: dict[str, Any]) -> dict[str, Any]:
+
+
+def _local(tag: str) -> str:
+    return tag.rsplit('}', 1)[-1] if '}' in tag else tag
+
+
+def parse_ipc2581(project_root: Path, files: list[ClassifiedFile]) -> dict[str, Any]:
+    warnings: list[dict[str, Any]] = []
+    cands = sorted([f for f in files if f.category == "ipc2581_candidate"], key=lambda f: f.relative_path)
+    if not cands:
+        warnings.append({"code": "WARN_IPC_MISSING", "message": "No IPC-2581 candidate discovered."})
+        empty_counts={"board_component_count":0,"placement_count":0,"board_net_count":0,"layer_count":0,"stackup_layer_count":0,"via_count":0,"drill_count":0,"route_segment_count":0,"outline_point_count":0}
+        return {"source_file":None,"parser_version":IPC_PARSER_VERSION,"ipc_root":None,"ipc_revision":None,"namespace":None,"units":None,"components":[],"nets":[],"layers":[],"stackup_layers":[],"outline":[],"vias":[],"drills":[],"route_segments":[],"analysis":{},"warnings":warnings,"extraction_counts":empty_counts}
+    src=cands[0]
+    if len(cands)>1:
+        warnings.append({"code":"WARN_IPC_MULTIPLE_CANDIDATES","message":f"Multiple IPC candidates found ({len(cands)}); using {src.relative_path}"})
+    path=project_root/src.relative_path
+    try:
+        root=ET.parse(path).getroot()
+    except Exception as exc:
+        warnings.append({"code":"WARN_IPC_PARSE_FAILED","message":"IPC XML parse failed."})
+        return {"source_file":src.relative_path,"parser_version":IPC_PARSER_VERSION,"ipc_root":None,"ipc_revision":None,"namespace":None,"units":None,"components":[],"nets":[],"layers":[],"stackup_layers":[],"outline":[],"vias":[],"drills":[],"route_segments":[],"analysis":{},"warnings":warnings,"extraction_counts":{"board_component_count":0,"placement_count":0,"board_net_count":0,"layer_count":0,"stackup_layer_count":0,"via_count":0,"drill_count":0,"route_segment_count":0,"outline_point_count":0},"error":str(exc)}
+
+    ns = root.tag.split('}')[0].strip('{') if root.tag.startswith('{') else None
+    ipc_root=_local(root.tag)
+    rev=root.attrib.get('revision') or root.attrib.get('Revision')
+    units=None
+
+    layers=[]; layer_names=set()
+    for e in root.iter():
+        t=_local(e.tag)
+        if t in {"Layer", "LayerRef"}:
+            name=e.attrib.get('name') or e.attrib.get('layerRef') or e.attrib.get('id')
+            if name and name not in layer_names:
+                layer_names.add(name)
+                layers.append({"name":name,"type":e.attrib.get('layerFunction') or e.attrib.get('type'),"side":e.attrib.get('side')})
+
+    components=[]
+    for e in root.iter():
+        if _local(e.tag) in {"Component","CompInstance"}:
+            ref=e.attrib.get('refDes') or e.attrib.get('refdes') or e.attrib.get('name')
+            if not ref: continue
+            if units is None and (e.attrib.get('unit') or e.attrib.get('units')):
+                units=e.attrib.get('unit') or e.attrib.get('units')
+            components.append({"refdes":ref,"footprint":e.attrib.get('packageRef') or e.attrib.get('part') or e.attrib.get('cellRef'),"layer":e.attrib.get('layerRef') or e.attrib.get('side'),"x":e.attrib.get('x'),"y":e.attrib.get('y'),"rotation":e.attrib.get('rotation') or e.attrib.get('rot'),"source":{"format":"ipc2581","file":src.relative_path}})
+
+    nets=[]
+    for e in root.iter():
+        if _local(e.tag)=="Net":
+            name=e.attrib.get('name') or e.attrib.get('id') or 'unknown_net'
+            nodes=[]
+            for c in list(e.iter()):
+                ct=_local(c.tag)
+                if ct in {"PinRef","Pin","Node","Conductor"}:
+                    r=c.attrib.get('componentRef') or c.attrib.get('refDes') or c.attrib.get('refdes')
+                    p=c.attrib.get('pin') or c.attrib.get('pinRef') or c.attrib.get('number')
+                    if r or p:
+                        nodes.append({"refdes":r,"pin_number":p})
+            nets.append({"name":name,"node_count":len(nodes),"nodes":nodes})
+
+    stack=[]
+    for e in root.iter():
+        if _local(e.tag) in {"StackupLayer","Layer","Dielectric","Conductive"}:
+            if _local(e.tag)=="Layer" and not any(k in e.attrib for k in ("thickness","material","sequence")):
+                continue
+            name=e.attrib.get('name') or e.attrib.get('layerRef') or e.attrib.get('id')
+            if name:
+                stack.append({"name":name,"sequence":e.attrib.get('sequence') or e.attrib.get('order'),"material":e.attrib.get('material'),"thickness":e.attrib.get('thickness'),"dielectric_constant":e.attrib.get('er') or e.attrib.get('epsilonR'),"copper_thickness":e.attrib.get('copperThickness')})
+
+    vias=[]; drills=[]; routes=[]; outline=[]
+    for e in root.iter():
+        t=_local(e.tag)
+        if t=="Via": vias.append({"x":e.attrib.get('x'),"y":e.attrib.get('y'),"drill":e.attrib.get('drill')})
+        elif t in {"Drill","Hole"}: drills.append({"x":e.attrib.get('x'),"y":e.attrib.get('y'),"diameter":e.attrib.get('diameter') or e.attrib.get('drill')})
+        elif t in {"Segment","Trace","Line"}: routes.append({"x1":e.attrib.get('x1'),"y1":e.attrib.get('y1'),"x2":e.attrib.get('x2'),"y2":e.attrib.get('y2'),"net":e.attrib.get('net') or e.attrib.get('netRef')})
+        elif t in {"Profile","Outline","Contour","Polygon","Point"}:
+            if 'x' in e.attrib and 'y' in e.attrib: outline.append({"x":e.attrib.get('x'),"y":e.attrib.get('y')})
+
+    if not stack: warnings.append({"code":"WARN_IPC_STACKUP_UNAVAILABLE","message":"Stackup details unavailable or not reliably extractable."})
+    if not layers: warnings.append({"code":"WARN_IPC_LAYERS_UNAVAILABLE","message":"No layers extracted from IPC file."})
+
+    counts={"board_component_count":len(components),"placement_count":len(components),"board_net_count":len(nets),"layer_count":len(layers),"stackup_layer_count":len(stack),"via_count":len(vias),"drill_count":len(drills),"route_segment_count":len(routes),"outline_point_count":len(outline)}
+    analysis={"layer_count":len(layers),"layers_used":[l['name'] for l in layers],"ground_plane_layers":[l['name'] for l in layers if l['name'] and 'gnd' in l['name'].lower()],"signal_layers":[l['name'] for l in layers if l.get('type') and 'signal' in (l.get('type') or '').lower()]}
+    return {"source_file":src.relative_path,"parser_version":IPC_PARSER_VERSION,"ipc_root":ipc_root,"ipc_revision":rev,"namespace":ns,"units":units,"components":components,"nets":nets,"layers":layers,"stackup_layers":stack,"outline":outline,"vias":vias,"drills":drills,"route_segments":routes,"analysis":analysis,"warnings":warnings,"extraction_counts":counts}
+
+
+def build_board_export(project_name:str, project_root:Path, ipc:dict[str,Any])->dict[str,Any]:
+    return {"project_name":project_name,"source":{"project_root":str(project_root),"layout_file":ipc.get('source_file'),"format":"ipc2581","ipc_root":ipc.get('ipc_root'),"ipc_revision":ipc.get('ipc_revision'),"namespace":ipc.get('namespace')},"parser_version":ipc.get('parser_version'),"components":ipc.get('components',[]),"placements":ipc.get('components',[]),"nets":ipc.get('nets',[]),"layers":ipc.get('layers',[]),"board_outline":ipc.get('outline',[]),"vias":ipc.get('vias',[]),"drills":ipc.get('drills',[]),"routes":ipc.get('route_segments',[]),"analysis":ipc.get('analysis',{}),"warnings":ipc.get('warnings',[]),"extraction_counts":ipc.get('extraction_counts',{})}
+
+
+def build_stack_export(project_name:str, project_root:Path, ipc:dict[str,Any])->dict[str,Any]:
+    return {"project_name":project_name,"source":{"project_root":str(project_root),"layout_file":ipc.get('source_file'),"format":"ipc2581"},"parser_version":ipc.get('parser_version'),"units":ipc.get('units'),"layer_stack":ipc.get('stackup_layers',[]),"warnings":ipc.get('warnings',[]),"extraction_counts":{"stackup_layer_count":ipc.get('extraction_counts',{}).get('stackup_layer_count',0),"layer_count":ipc.get('extraction_counts',{}).get('layer_count',0)}}
+def build_report(args: argparse.Namespace, project_root: Path, output_root: Path, project_name: str, files: list[ClassifiedFile], warnings: list[dict[str, Any]], bom: dict[str, Any], pads: dict[str, Any], ipc: dict[str, Any]) -> dict[str, Any]:
     counts: dict[str, int] = {}
     for f in files:
         counts[f.category] = counts.get(f.category, 0) + 1
@@ -402,10 +496,11 @@ def build_report(args: argparse.Namespace, project_root: Path, output_root: Path
             "json_validation": {"status": "skipped" if args.dry_run or args.report_only else "pending"},
         },
         "planned_outputs": planned_outputs(project_name, output_root),
-        "warnings": warnings + bom.get("warnings", []) + pads.get("warnings", []),
+        "ipc2581": {"source_file": ipc.get("source_file"), "root": ipc.get("ipc_root"), "revision": ipc.get("ipc_revision"), "namespace": ipc.get("namespace"), "component_count": ipc.get("extraction_counts", {}).get("board_component_count", 0), "placement_count": ipc.get("extraction_counts", {}).get("placement_count", 0), "net_count": ipc.get("extraction_counts", {}).get("board_net_count", 0), "layer_count": ipc.get("extraction_counts", {}).get("layer_count", 0), "stackup_layer_count": ipc.get("extraction_counts", {}).get("stackup_layer_count", 0), "via_count": ipc.get("extraction_counts", {}).get("via_count", 0), "drill_count": ipc.get("extraction_counts", {}).get("drill_count", 0), "route_segment_count": ipc.get("extraction_counts", {}).get("route_segment_count", 0), "outline_point_count": ipc.get("extraction_counts", {}).get("outline_point_count", 0), "parse_warnings": ipc.get("warnings", []), "board_output_file": str(output_root / f"{project_name}-thomson-export-brd.json"), "stack_output_file": str(output_root / f"{project_name}-thomson-export-stack.json"), "board_json_validation": {"status": "skipped" if args.dry_run or args.report_only else "pending"}, "stack_json_validation": {"status": "skipped" if args.dry_run or args.report_only else "pending"}},
+        "warnings": warnings + bom.get("warnings", []) + pads.get("warnings", []) + ipc.get("warnings", []),
         "errors": [],
         "notes": [
-            "Phase 1 performs discovery/reporting.", "Phase 2 adds BOM parsing.", "Phase 3 adds PADS schematic parsing and BOM merge.",
+            "Phase 1 performs discovery/reporting.", "Phase 2 adds BOM parsing.", "Phase 3 adds PADS schematic parsing and BOM merge.", "Phase 4 adds IPC-2581 board/stack parsing.",
             "WARNING: tools/kicad-export.py not found in this repository snapshot; schematic shape uses a compatibility-oriented best effort.",
         ],
     }
@@ -422,7 +517,7 @@ def report_markdown(report: dict[str, Any]) -> str:
     ]
     for c, n in sorted(report["discovery"]["counts_by_category"].items()):
         lines.append(f"- {c}: {n}")
-    lines += ["", "## BOM", f"- Source file: `{b.get('source_file')}`", f"- Row count: {b.get('row_count', 0)}", "", "## Schematic (PADS)", f"- Source file: `{s.get('source_file')}`", f"- Detected dialect: {s.get('detected_dialect')}", f"- Components: {s.get('component_count', 0)}", f"- Nets: {s.get('net_count', 0)}", f"- Nodes: {s.get('node_count', 0)}", f"- Schematic JSON validation: {s.get('json_validation', {}).get('status', 'unknown')}", "", "## Warnings"]
+    lines += ["", "## BOM", f"- Source file: `{b.get('source_file')}`", f"- Row count: {b.get('row_count', 0)}", "", "## Schematic (PADS)", f"- Source file: `{s.get('source_file')}`", f"- Detected dialect: {s.get('detected_dialect')}", f"- Components: {s.get('component_count', 0)}", f"- Nets: {s.get('net_count', 0)}", f"- Nodes: {s.get('node_count', 0)}", f"- Schematic JSON validation: {s.get('json_validation', {}).get('status', 'unknown')}", "", "## IPC-2581 / Board", f"- Source file: `{report.get('ipc2581',{}).get('source_file')}`", f"- Root: {report.get('ipc2581',{}).get('root')}", f"- Revision: {report.get('ipc2581',{}).get('revision')}", f"- Namespace present: {bool(report.get('ipc2581',{}).get('namespace'))}", f"- Board components: {report.get('ipc2581',{}).get('component_count',0)}", f"- Layers: {report.get('ipc2581',{}).get('layer_count',0)}", f"- Nets: {report.get('ipc2581',{}).get('net_count',0)}", f"- Stack layers: {report.get('ipc2581',{}).get('stackup_layer_count',0)}", f"- Board JSON validation: {report.get('ipc2581',{}).get('board_json_validation',{}).get('status','unknown')}", f"- Stack JSON validation: {report.get('ipc2581',{}).get('stack_json_validation',{}).get('status','unknown')}", "", "## Warnings"]
     if report["warnings"]:
         for w in report["warnings"]:
             lines.append(f"- {w['code']}: {w['message']}")
@@ -445,12 +540,17 @@ def main() -> int:
     bom = parse_bom(project_name, project_root, files)
     pads = parse_pads(project_root, files, bom)
     sch = build_schematic_export(project_name, project_root, pads)
-    report = build_report(args, project_root, output_root, project_name, files, top_warnings, bom, pads)
+    ipc = parse_ipc2581(project_root, files)
+    brd = build_board_export(project_name, project_root, ipc)
+    stack = build_stack_export(project_name, project_root, ipc)
+    report = build_report(args, project_root, output_root, project_name, files, top_warnings, bom, pads, ipc)
 
     report_json = output_root / f"{project_name}-conversion-report.json"
     report_md = output_root / f"{project_name}-conversion-report.md"
     bom_json = output_root / f"{project_name}-bom.json"
     sch_json = output_root / f"{project_name}-thomson-export-sch.json"
+    brd_json = output_root / f"{project_name}-thomson-export-brd.json"
+    stack_json = output_root / f"{project_name}-thomson-export-stack.json"
 
     if args.dry_run:
         print("[dry-run] planned report outputs:")
@@ -458,6 +558,8 @@ def main() -> int:
         print(f"[dry-run] - {report_md}")
         print(f"[dry-run] - {bom_json}")
         print(f"[dry-run] - {sch_json}")
+        print(f"[dry-run] - {brd_json}")
+        print(f"[dry-run] - {stack_json}")
     else:
         output_root.mkdir(parents=True, exist_ok=True)
         if not args.report_only:
@@ -465,6 +567,10 @@ def main() -> int:
                 json.dump(bom, f, indent=2 if args.pretty else None)
             with sch_json.open("w", encoding="utf-8") as f:
                 json.dump(sch, f, indent=2 if args.pretty else None)
+            with brd_json.open("w", encoding="utf-8") as f:
+                json.dump(brd, f, indent=2 if args.pretty else None)
+            with stack_json.open("w", encoding="utf-8") as f:
+                json.dump(stack, f, indent=2 if args.pretty else None)
             try:
                 json.loads(bom_json.read_text(encoding="utf-8"))
                 report["bom"]["json_validation"] = {"status": "pass"}
@@ -477,6 +583,18 @@ def main() -> int:
             except Exception as exc:
                 report["schematic"]["json_validation"] = {"status": "fail", "error": str(exc)}
                 report["errors"].append({"code": "ERR_SCHEMATIC_JSON_INVALID", "message": str(exc)})
+            try:
+                json.loads(brd_json.read_text(encoding="utf-8"))
+                report["ipc2581"]["board_json_validation"] = {"status": "pass"}
+            except Exception as exc:
+                report["ipc2581"]["board_json_validation"] = {"status": "fail", "error": str(exc)}
+                report["errors"].append({"code": "ERR_BOARD_JSON_INVALID", "message": str(exc)})
+            try:
+                json.loads(stack_json.read_text(encoding="utf-8"))
+                report["ipc2581"]["stack_json_validation"] = {"status": "pass"}
+            except Exception as exc:
+                report["ipc2581"]["stack_json_validation"] = {"status": "fail", "error": str(exc)}
+                report["errors"].append({"code": "ERR_STACK_JSON_INVALID", "message": str(exc)})
 
         with report_json.open("w", encoding="utf-8") as f:
             json.dump(report, f, indent=2 if args.pretty else None)
