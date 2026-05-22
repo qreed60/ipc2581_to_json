@@ -83,10 +83,15 @@ def classify_file(path: Path, root: Path, role_hint: str) -> ClassifiedFile:
         return ClassifiedFile(rel, ext, size, "bom_csv_candidate", "high", "CSV in schematic scope likely BOM")
     if ext in {".xml", ".ipc2581", ".cvg", ".ipc"} and role_hint == "layout":
         return ClassifiedFile(rel, ext, size, "ipc2581_candidate", "high", "Layout XML/IPC2581 extension")
+    if ext == ".pdf":
+        if any(k in name for k in ["gerber", "gerbers", "photoplot", "plot", "artwork", "copper", "silk", "layer", "pcb", "layout"]):
+            return ClassifiedFile(rel, ext, size, "layout_pdf_candidate", "high", "Filename suggests layout/Gerber PDF")
+        if any(k in name for k in ["schematic", "sch", "circuit", "pages", "capture", "orcad"]):
+            return ClassifiedFile(rel, ext, size, "schematic_pdf_candidate", "high", "Filename suggests schematic PDF")
     if ext == ".pdf" and role_hint == "schematic":
-        return ClassifiedFile(rel, ext, size, "schematic_pdf_candidate", "high", "PDF under schematic scope")
+        return ClassifiedFile(rel, ext, size, "schematic_pdf_candidate", "medium", "PDF under schematic scope")
     if ext == ".pdf" and role_hint == "layout":
-        return ClassifiedFile(rel, ext, size, "layout_pdf_candidate", "high", "PDF under layout scope")
+        return ClassifiedFile(rel, ext, size, "layout_pdf_candidate", "medium", "PDF under layout scope")
     if ext == ".csv":
         return ClassifiedFile(rel, ext, size, "bom_csv_candidate", "medium", "CSV found outside schematic scope; treated as BOM candidate")
     if ext in {".xml", ".ipc2581", ".cvg", ".ipc"}:
@@ -94,7 +99,7 @@ def classify_file(path: Path, root: Path, role_hint: str) -> ClassifiedFile:
     if ext == ".pdf":
         if "schem" in name:
             return ClassifiedFile(rel, ext, size, "schematic_pdf_candidate", "medium", "Filename suggests schematic PDF")
-        if any(k in name for k in ["gerber", "layout", "pcb"]):
+        if any(k in name for k in ["gerber", "layout", "pcb", "silk", "copper", "layer", "plot", "photoplot", "artwork"]):
             return ClassifiedFile(rel, ext, size, "layout_pdf_candidate", "medium", "Filename suggests layout/Gerber PDF")
     return ClassifiedFile(rel, ext, size, "unknown", "low", "No classifier rule matched")
 
@@ -269,10 +274,12 @@ def parse_pads(project_root: Path, files: list[ClassifiedFile], bom: dict[str, A
         if current_section == "part":
             toks = line.split()
             if len(toks) >= 2:
-                refdes = toks[1]
+                refdes = toks[0]
+                if toks[0].upper() in {"COMP", "PART"} and len(toks) > 1:
+                    refdes = toks[1]
                 value = None
                 footprint = None
-                part_name = toks[0]
+                part_name = toks[1] if refdes == toks[0] else toks[0]
                 for tk in toks[2:]:
                     low = tk.lower()
                     if low.startswith("value="):
@@ -281,6 +288,11 @@ def parse_pads(project_root: Path, files: list[ClassifiedFile], bom: dict[str, A
                         footprint = tk.split("=", 1)[1]
                 components[refdes] = {"refdes": refdes, "value": value, "footprint": footprint, "package": footprint, "part_name": part_name, "source": {"format": "pads_ascii", "file": source.relative_path}}
         elif current_section == "net":
+            if line.upper().startswith("*SIGNAL*"):
+                if current_net:
+                    nets.append(current_net)
+                current_net = {"name": line.split(maxsplit=1)[1].strip() if len(line.split(maxsplit=1)) > 1 else "unknown_net", "nodes": []}
+                continue
             if line.upper().startswith("NET "):
                 if current_net:
                     nets.append(current_net)
@@ -299,7 +311,7 @@ def parse_pads(project_root: Path, files: list[ClassifiedFile], bom: dict[str, A
     if not components:
         warnings.append({"code": "WARN_PADS_NO_COMPONENTS", "message": "No components extracted from PADS file."})
     if not nets:
-        warnings.append({"code": "WARN_PADS_NO_NETS", "message": "No nets extracted from PADS file."})
+        warnings.append({"code": "WARN_PADS_NO_NETS", "message": "No nets extracted from PADS file; fixture may be component-only or net sections were not found."})
 
     # BOM merge
     bom_map: dict[str, dict[str, Any]] = {}

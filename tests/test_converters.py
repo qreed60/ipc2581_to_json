@@ -114,6 +114,9 @@ def test_phase1_examples_compat_mode(tmp_path):
     assert cats["bom_csv_candidate"] == 1
     assert cats["ipc2581_candidate"] == 1
     assert cats.get("schematic_pdf_candidate", 0) + cats.get("layout_pdf_candidate", 0) == 2
+    files = report["discovery"]["files"]
+    gerber = [f for f in files if f["relative_path"] == "example_gerbers.pdf"][0]
+    assert gerber["category"] == "layout_pdf_candidate"
 
 def test_phase2_bom_simple_and_multi_refdes(tmp_path):
     root = Path(__file__).resolve().parents[1]
