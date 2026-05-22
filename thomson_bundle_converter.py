@@ -135,7 +135,9 @@ HEADER_MAP = {
     "refdes": "refdes", "designator": "refdes", "reference": "refdes", "references": "refdes",
     "value": "value", "description": "description", "manufacturer": "manufacturer", "mpn": "mpn", "manufacturerpartnumber": "mpn",
     "vendor": "vendor", "vendorpn": "vendor_pn", "quantity": "quantity", "qty": "quantity", "footprint": "footprint", "package": "package",
-    "dni": "dnp", "dnp": "dnp", "donotinstall": "dnp", "part": "item", "item": "item"
+    "dni": "dnp", "dnp": "dnp", "donotinstall": "dnp", "part": "item", "item": "item",
+    "mfg1": "manufacturer", "mfg2": "manufacturer", "mfg3": "manufacturer",
+    "mfgpn1": "mpn", "mfgpn2": "mpn", "mfgpn3": "mpn"
 }
 
 
@@ -210,6 +212,26 @@ def parse_bom(project_name: str, project_root: Path, files: list[ClassifiedFile]
                     dnp_val = parsed
                     break
 
+        manufacturer_alternates: list[dict[str, Any]] = []
+        for rank in (1, 2, 3):
+            mfg_candidates = [
+                f"MFG_{rank}", f"MFG {rank}", f"Manufacturer_{rank}", f"Manufacturer {rank}"
+            ]
+            mpn_candidates = [
+                f"MFG P/N_{rank}", f"MFG P/N {rank}", f"MPN_{rank}", f"Manufacturer Part Number_{rank}"
+            ]
+            mfg_val = next(((row.get(h) or "").strip() for h in mfg_candidates if (row.get(h) or "").strip()), None)
+            mpn_val = next(((row.get(h) or "").strip() for h in mpn_candidates if (row.get(h) or "").strip()), None)
+            if mfg_val or mpn_val:
+                manufacturer_alternates.append({"manufacturer": mfg_val, "mpn": mpn_val, "rank": rank})
+
+        primary_manufacturer = pick("manufacturer")
+        primary_mpn = pick("mpn")
+        if not primary_manufacturer and manufacturer_alternates:
+            primary_manufacturer = manufacturer_alternates[0].get("manufacturer")
+        if not primary_mpn and manufacturer_alternates:
+            primary_mpn = manufacturer_alternates[0].get("mpn")
+
         items.append({
             "refdes": refs,
             "fields": {
@@ -217,8 +239,11 @@ def parse_bom(project_name: str, project_root: Path, files: list[ClassifiedFile]
                 "mpn": pick("mpn"), "vendor": pick("vendor"), "vendor_pn": pick("vendor_pn"),
                 "quantity": pick("quantity"), "footprint": pick("footprint"), "package": pick("package"), "dnp": dnp_val,
             },
+            "manufacturers": manufacturer_alternates,
             "raw_row_index": idx,
         })
+        items[-1]["fields"]["manufacturer"] = primary_manufacturer
+        items[-1]["fields"]["mpn"] = primary_mpn
 
     duplicates = sorted([k for k, v in ref_counts.items() if v > 1])
     if duplicates:
@@ -299,12 +324,16 @@ def parse_pads(project_root: Path, files: list[ClassifiedFile], bom: dict[str, A
                 current_net = {"name": line[4:].strip(), "nodes": []}
                 continue
             if current_net is not None:
-                pin_token = line.split()[0]
-                if "." in pin_token:
-                    refdes, pin = pin_token.split(".", 1)
-                else:
-                    refdes, pin = pin_token, None
-                current_net["nodes"].append({"refdes": refdes, "pin_number": pin, "pin_name": None})
+                for pin_token in line.split():
+                    if pin_token.startswith("*"):
+                        continue
+                    if "." in pin_token:
+                        refdes, pin = pin_token.rsplit(".", 1)
+                    else:
+                        refdes, pin = pin_token, None
+                    if not refdes:
+                        continue
+                    current_net["nodes"].append({"refdes": refdes, "pin_number": pin, "pin_name": None})
     if current_net:
         nets.append(current_net)
 

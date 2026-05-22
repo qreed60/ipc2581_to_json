@@ -181,6 +181,8 @@ def test_phase3_pads_parse_and_bom_merge(tmp_path):
     assert len(sch["components"]) == 2
     assert len(sch["nets"]) == 2
     assert sch["bom_merge"]["components_with_bom_metadata"] == 2
+    sig = {n["name"]: n for n in sch["nets"]}["SIG"]
+    assert sig["node_count"] == 2
 
 
 def test_phase3_pads_value_mismatch_warning(tmp_path):
@@ -312,3 +314,29 @@ def test_phase6_examples_smoke_validation_if_present(tmp_path):
     assert r.returncode == 0
     report = json.loads((out / "example-conversion-report.json").read_text())
     assert "validation" in report
+
+
+def test_phase66_pads_multinode_line_and_numbered_mfg_headers(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    proj = tmp_path / "proj"
+    (proj / "pre_conversion" / "schematic").mkdir(parents=True)
+    (proj / "pre_conversion" / "layout").mkdir(parents=True)
+    (proj / "pre_conversion" / "schematic" / "net.asc").write_text(
+        "*PADS-PCB*\n*PART*\nJ3 footprint\nJ27 footprint\n*NET*\n*SIGNAL* ABORT_NEG\nJ3.41 J27.30\n"
+    )
+    (proj / "pre_conversion" / "schematic" / "bom.csv").write_text(
+        "RefDes,MFG_1,MFG P/N_1\nJ3,Murata,ABC123\nJ27,AVX,XYZ999\n"
+    )
+    (proj / "pre_conversion" / "layout" / "i.xml").write_text("<IPC-2581/>")
+    out = tmp_path / "out"
+    r = run(["python3", "thomson_bundle_converter.py", str(proj), "--output-root", str(out)], root)
+    assert r.returncode == 0
+    sch = json.loads((out / "proj-thomson-export-sch.json").read_text())
+    net = {n["name"]: n for n in sch["nets"]}["ABORT_NEG"]
+    assert net["node_count"] == 2
+    refs = {n["refdes"] for n in net["nodes"]}
+    assert {"J3", "J27"} <= refs
+    bom = json.loads((out / "proj-bom.json").read_text())
+    first = bom["items"][0]
+    assert first["fields"]["manufacturer"] is not None
+    assert first["fields"]["mpn"] is not None
