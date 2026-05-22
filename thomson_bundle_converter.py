@@ -344,8 +344,12 @@ def parse_pads(project_root: Path, files: list[ClassifiedFile], bom: dict[str, A
 
     # BOM merge
     bom_map: dict[str, dict[str, Any]] = {}
+    non_electrical = set()
     for item in bom.get("items", []):
         for rd in item.get("refdes", []):
+            if re.match(r"^(ASM|FAB|PCB|SCH)", rd, re.IGNORECASE) or re.fullmatch(r"\d+", rd or ""):
+                non_electrical.add(rd)
+                continue
             bom_map[rd] = item.get("fields", {})
 
     with_bom = 0
@@ -369,7 +373,7 @@ def parse_pads(project_root: Path, files: list[ClassifiedFile], bom: dict[str, A
             missing_bom += 1
 
     comp_refs = set(components.keys())
-    unmatched_bom_refdes = sorted([r for r in bom_map if r not in comp_refs])
+    unmatched_bom_refdes = sorted([r for r in bom_map if r not in comp_refs and r not in non_electrical])
 
     node_count = sum(len(n["nodes"]) for n in nets)
     single_pin_nets = [n["name"] for n in nets if len(n["nodes"]) <= 1]
@@ -446,14 +450,24 @@ def parse_ipc2581(project_root: Path, files: list[ClassifiedFile]) -> dict[str, 
     rev=root.attrib.get('revision') or root.attrib.get('Revision')
     units=None
 
-    layers=[]; layer_names=set()
+    layers=[]; layer_by_name={}
     for e in root.iter():
         t=_local(e.tag)
         if t in {"Layer", "LayerRef"}:
             name=e.attrib.get('name') or e.attrib.get('layerRef') or e.attrib.get('id')
-            if name and name not in layer_names:
-                layer_names.add(name)
-                layers.append({"name":name,"type":e.attrib.get('layerFunction') or e.attrib.get('type'),"side":e.attrib.get('side')})
+            if not name:
+                continue
+            lf = e.attrib.get('layerFunction') or e.attrib.get('type')
+            item = layer_by_name.get(name)
+            if item is None:
+                item = {"name": name, "type": lf, "function": e.attrib.get('layerFunction'), "side": e.attrib.get('side'), "polarity": e.attrib.get('polarity')}
+                layer_by_name[name] = item
+                layers.append(item)
+            else:
+                item["type"] = item.get("type") or lf
+                item["function"] = item.get("function") or e.attrib.get('layerFunction')
+                item["side"] = item.get("side") or e.attrib.get('side')
+                item["polarity"] = item.get("polarity") or e.attrib.get('polarity')
 
     components=[]
     for e in root.iter():
@@ -462,11 +476,20 @@ def parse_ipc2581(project_root: Path, files: list[ClassifiedFile]) -> dict[str, 
             if not ref: continue
             if units is None and (e.attrib.get('unit') or e.attrib.get('units')):
                 units=e.attrib.get('unit') or e.attrib.get('units')
-            components.append({"refdes":ref,"footprint":e.attrib.get('packageRef') or e.attrib.get('part') or e.attrib.get('cellRef'),"layer":e.attrib.get('layerRef') or e.attrib.get('side'),"x":e.attrib.get('x'),"y":e.attrib.get('y'),"rotation":e.attrib.get('rotation') or e.attrib.get('rot'),"source":{"format":"ipc2581","file":src.relative_path}})
+            loc = next((c for c in list(e) if _local(c.tag) == "Location"), None)
+            x = e.attrib.get('x')
+            y = e.attrib.get('y')
+            if loc is not None:
+                x = x or loc.attrib.get('x')
+                y = y or loc.attrib.get('y')
+            components.append({"refdes":ref,"footprint":e.attrib.get('packageRef') or e.attrib.get('part') or e.attrib.get('cellRef'),"layer":e.attrib.get('layerRef') or e.attrib.get('side'),"x":x,"y":y,"rotation":e.attrib.get('rotation') or e.attrib.get('rot'),"source":{"format":"ipc2581","file":src.relative_path}})
 
     nets=[]
+    physical_nets=[]
+    phy_point_count = 0
     for e in root.iter():
-        if _local(e.tag)=="Net":
+        tag = _local(e.tag)
+        if tag in {"Net", "LogicalNet"}:
             name=e.attrib.get('name') or e.attrib.get('id') or 'unknown_net'
             nodes=[]
             for c in list(e.iter()):
@@ -477,6 +500,21 @@ def parse_ipc2581(project_root: Path, files: list[ClassifiedFile]) -> dict[str, 
                     if r or p:
                         nodes.append({"refdes":r,"pin_number":p})
             nets.append({"name":name,"node_count":len(nodes),"nodes":nodes})
+        elif tag == "PhyNet":
+            pname = e.attrib.get("name") or e.attrib.get("id") or "unknown_phynet"
+            points = []
+            for c in list(e.iter()):
+                if _local(c.tag) == "PhyNetPoint":
+                    points.append({
+                        "x": c.attrib.get("x"),
+                        "y": c.attrib.get("y"),
+                        "layerRef": c.attrib.get("layerRef"),
+                        "netNode": c.attrib.get("netNode"),
+                        "via": c.attrib.get("via"),
+                        "exposure": c.attrib.get("exposure"),
+                    })
+            phy_point_count += len(points)
+            physical_nets.append({"name": pname, "points": points, "point_count": len(points)})
 
     stack=[]
     for e in root.iter():
@@ -493,23 +531,26 @@ def parse_ipc2581(project_root: Path, files: list[ClassifiedFile]) -> dict[str, 
         if t=="Via": vias.append({"x":e.attrib.get('x'),"y":e.attrib.get('y'),"drill":e.attrib.get('drill')})
         elif t in {"Drill","Hole"}: drills.append({"x":e.attrib.get('x'),"y":e.attrib.get('y'),"diameter":e.attrib.get('diameter') or e.attrib.get('drill')})
         elif t in {"Segment","Trace","Line"}: routes.append({"x1":e.attrib.get('x1'),"y1":e.attrib.get('y1'),"x2":e.attrib.get('x2'),"y2":e.attrib.get('y2'),"net":e.attrib.get('net') or e.attrib.get('netRef')})
-        elif t in {"Profile","Outline","Contour","Polygon","Point"}:
+        elif t in {"Profile","Outline","Contour","Polygon","Point","PolyBegin","PolyStepSegment"}:
             if 'x' in e.attrib and 'y' in e.attrib: outline.append({"x":e.attrib.get('x'),"y":e.attrib.get('y')})
 
-    if not stack: warnings.append({"code":"WARN_IPC_STACKUP_UNAVAILABLE","message":"Stackup details unavailable or not reliably extractable."})
+    if not stack:
+        for l in layers:
+            stack.append({"name": l.get("name"), "sequence": None, "material": None, "thickness": None, "dielectric_constant": None, "copper_thickness": None, "function": l.get("function"), "side": l.get("side"), "polarity": l.get("polarity")})
+        warnings.append({"code":"WARN_IPC_STACKUP_UNAVAILABLE","message":"Material/thickness stackup details unavailable; using known ordered layer metadata."})
     if not layers: warnings.append({"code":"WARN_IPC_LAYERS_UNAVAILABLE","message":"No layers extracted from IPC file."})
 
-    counts={"board_component_count":len(components),"placement_count":len(components),"board_net_count":len(nets),"layer_count":len(layers),"stackup_layer_count":len(stack),"via_count":len(vias),"drill_count":len(drills),"route_segment_count":len(routes),"outline_point_count":len(outline)}
+    counts={"board_component_count":len(components),"placement_count":len(components),"placements_with_xy_count":sum(1 for c in components if c.get("x") is not None and c.get("y") is not None),"board_net_count":len(nets),"logical_net_count":len(nets),"physical_net_count":len(physical_nets),"phy_net_point_count":phy_point_count,"layer_count":len(layers),"stackup_layer_count":len(stack),"via_count":len(vias),"drill_count":len(drills),"route_segment_count":len(routes),"outline_point_count":len(outline)}
     analysis={"layer_count":len(layers),"layers_used":[l['name'] for l in layers],"ground_plane_layers":[l['name'] for l in layers if l['name'] and 'gnd' in l['name'].lower()],"signal_layers":[l['name'] for l in layers if l.get('type') and 'signal' in (l.get('type') or '').lower()]}
-    return {"source_file":src.relative_path,"parser_version":IPC_PARSER_VERSION,"ipc_root":ipc_root,"ipc_revision":rev,"namespace":ns,"units":units,"components":components,"nets":nets,"layers":layers,"stackup_layers":stack,"outline":outline,"vias":vias,"drills":drills,"route_segments":routes,"analysis":analysis,"warnings":warnings,"extraction_counts":counts}
+    return {"source_file":src.relative_path,"parser_version":IPC_PARSER_VERSION,"ipc_root":ipc_root,"ipc_revision":rev,"namespace":ns,"units":units,"components":components,"nets":nets,"physical_nets":physical_nets,"layers":layers,"stackup_layers":stack,"outline":outline,"vias":vias,"drills":drills,"route_segments":routes,"analysis":analysis,"warnings":warnings,"extraction_counts":counts}
 
 
 def build_board_export(project_name:str, project_root:Path, ipc:dict[str,Any])->dict[str,Any]:
-    return {"project_name":project_name,"source":{"project_root":str(project_root),"layout_file":ipc.get('source_file'),"format":"ipc2581","ipc_root":ipc.get('ipc_root'),"ipc_revision":ipc.get('ipc_revision'),"namespace":ipc.get('namespace')},"parser_version":ipc.get('parser_version'),"components":ipc.get('components',[]),"placements":ipc.get('components',[]),"nets":ipc.get('nets',[]),"layers":ipc.get('layers',[]),"board_outline":ipc.get('outline',[]),"vias":ipc.get('vias',[]),"drills":ipc.get('drills',[]),"routes":ipc.get('route_segments',[]),"analysis":ipc.get('analysis',{}),"warnings":ipc.get('warnings',[]),"extraction_counts":ipc.get('extraction_counts',{})}
+    return {"project_name":project_name,"source":{"project_root":str(project_root),"layout_file":ipc.get('source_file'),"format":"ipc2581","ipc_root":ipc.get('ipc_root'),"ipc_revision":ipc.get('ipc_revision'),"namespace":ipc.get('namespace')},"parser_version":ipc.get('parser_version'),"components":ipc.get('components',[]),"placements":ipc.get('components',[]),"nets":ipc.get('nets',[]),"physical_nets":ipc.get('physical_nets',[]),"layers":ipc.get('layers',[]),"board_outline":ipc.get('outline',[]),"vias":ipc.get('vias',[]),"drills":ipc.get('drills',[]),"routes":ipc.get('route_segments',[]),"analysis":ipc.get('analysis',{}),"warnings":ipc.get('warnings',[]),"extraction_counts":ipc.get('extraction_counts',{})}
 
 
 def build_stack_export(project_name:str, project_root:Path, ipc:dict[str,Any])->dict[str,Any]:
-    return {"project_name":project_name,"source":{"project_root":str(project_root),"layout_file":ipc.get('source_file'),"format":"ipc2581"},"parser_version":ipc.get('parser_version'),"units":ipc.get('units'),"layer_stack":ipc.get('stackup_layers',[]),"warnings":ipc.get('warnings',[]),"extraction_counts":{"stackup_layer_count":ipc.get('extraction_counts',{}).get('stackup_layer_count',0),"layer_count":ipc.get('extraction_counts',{}).get('layer_count',0)}}
+    return {"project_name":project_name,"source":{"project_root":str(project_root),"layout_file":ipc.get('source_file'),"format":"ipc2581"},"parser_version":ipc.get('parser_version'),"units":ipc.get('units'),"layer_stack":ipc.get('stackup_layers',[]),"layers":ipc.get('stackup_layers',[]),"warnings":ipc.get('warnings',[]),"extraction_counts":{"stackup_layer_count":ipc.get('extraction_counts',{}).get('stackup_layer_count',0),"layer_count":ipc.get('extraction_counts',{}).get('layer_count',0)}}
 
 
 def render_pdf_images(args: argparse.Namespace, project_root: Path, output_root: Path, project_name: str, files: list[ClassifiedFile]) -> dict[str, Any]:
@@ -679,7 +720,7 @@ def build_report(args: argparse.Namespace, project_root: Path, output_root: Path
             "json_validation": {"status": "skipped" if args.dry_run or args.report_only else "pending"},
         },
         "planned_outputs": planned_outputs(project_name, output_root),
-        "ipc2581": {"source_file": ipc.get("source_file"), "root": ipc.get("ipc_root"), "revision": ipc.get("ipc_revision"), "namespace": ipc.get("namespace"), "component_count": ipc.get("extraction_counts", {}).get("board_component_count", 0), "placement_count": ipc.get("extraction_counts", {}).get("placement_count", 0), "net_count": ipc.get("extraction_counts", {}).get("board_net_count", 0), "layer_count": ipc.get("extraction_counts", {}).get("layer_count", 0), "stackup_layer_count": ipc.get("extraction_counts", {}).get("stackup_layer_count", 0), "via_count": ipc.get("extraction_counts", {}).get("via_count", 0), "drill_count": ipc.get("extraction_counts", {}).get("drill_count", 0), "route_segment_count": ipc.get("extraction_counts", {}).get("route_segment_count", 0), "outline_point_count": ipc.get("extraction_counts", {}).get("outline_point_count", 0), "parse_warnings": ipc.get("warnings", []), "board_output_file": str(output_root / f"{project_name}-thomson-export-brd.json"), "stack_output_file": str(output_root / f"{project_name}-thomson-export-stack.json"), "board_json_validation": {"status": "skipped" if args.dry_run or args.report_only else "pending"}, "stack_json_validation": {"status": "skipped" if args.dry_run or args.report_only else "pending"}},
+        "ipc2581": {"source_file": ipc.get("source_file"), "root": ipc.get("ipc_root"), "revision": ipc.get("ipc_revision"), "namespace": ipc.get("namespace"), "component_count": ipc.get("extraction_counts", {}).get("board_component_count", 0), "placement_count": ipc.get("extraction_counts", {}).get("placement_count", 0), "placements_with_xy_count": ipc.get("extraction_counts", {}).get("placements_with_xy_count", 0), "net_count": ipc.get("extraction_counts", {}).get("board_net_count", 0), "logical_net_count": ipc.get("extraction_counts", {}).get("logical_net_count", 0), "physical_net_count": ipc.get("extraction_counts", {}).get("physical_net_count", 0), "phy_net_point_count": ipc.get("extraction_counts", {}).get("phy_net_point_count", 0), "layer_count": ipc.get("extraction_counts", {}).get("layer_count", 0), "stackup_layer_count": ipc.get("extraction_counts", {}).get("stackup_layer_count", 0), "via_count": ipc.get("extraction_counts", {}).get("via_count", 0), "drill_count": ipc.get("extraction_counts", {}).get("drill_count", 0), "route_segment_count": ipc.get("extraction_counts", {}).get("route_segment_count", 0), "outline_point_count": ipc.get("extraction_counts", {}).get("outline_point_count", 0), "parse_warnings": ipc.get("warnings", []), "board_output_file": str(output_root / f"{project_name}-thomson-export-brd.json"), "stack_output_file": str(output_root / f"{project_name}-thomson-export-stack.json"), "board_json_validation": {"status": "skipped" if args.dry_run or args.report_only else "pending"}, "stack_json_validation": {"status": "skipped" if args.dry_run or args.report_only else "pending"}},
         "images": images.get("report", {}),
         "image_outputs": images.get("image_outputs", []),
         "validation": {},
