@@ -267,3 +267,45 @@ def test_phase5_real_examples_png_smoke_if_poppler(tmp_path):
     assert r.returncode == 0
     report = json.loads((out / "example-conversion-report.json").read_text())
     assert "images" in report
+
+def test_phase6_validation_summary_present(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    proj = tmp_path / "proj"
+    (proj / "pre_conversion" / "schematic").mkdir(parents=True)
+    (proj / "pre_conversion" / "layout").mkdir(parents=True)
+    (proj / "pre_conversion" / "schematic" / "n.asc").write_text("*PADS-PCB*\n*PART*\nCOMP U1\n*NET*\nNET G\nU1.1\n")
+    (proj / "pre_conversion" / "schematic" / "bom.csv").write_text("RefDes\nU1\n")
+    (proj / "pre_conversion" / "layout" / "i.xml").write_text("<IPC-2581/>")
+    out = tmp_path / "out"
+    r = run(["python3", "thomson_bundle_converter.py", str(proj), "--output-root", str(out), "--pretty"], root)
+    assert r.returncode == 0
+    report = json.loads((out / "proj-conversion-report.json").read_text())
+    assert "validation" in report
+    assert "ok" in report["validation"]
+
+
+def test_phase6_missing_optional_pdf_non_strict_ok(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    proj = tmp_path / "proj"
+    (proj / "pre_conversion" / "schematic").mkdir(parents=True)
+    (proj / "pre_conversion" / "layout").mkdir(parents=True)
+    (proj / "pre_conversion" / "schematic" / "n.asc").write_text("*PADS-PCB*\n*PART*\nCOMP U1\n*NET*\nNET G\nU1.1\n")
+    (proj / "pre_conversion" / "schematic" / "bom.csv").write_text("RefDes\nU1\n")
+    (proj / "pre_conversion" / "layout" / "i.xml").write_text("<IPC-2581/>")
+    out = tmp_path / "out"
+    r = run(["python3", "thomson_bundle_converter.py", str(proj), "--output-root", str(out)], root)
+    assert r.returncode == 0
+    report = json.loads((out / "proj-conversion-report.json").read_text())
+    assert report["validation"]["required_outputs_ok"] is True
+
+
+def test_phase6_examples_smoke_validation_if_present(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    examples = root / "examples"
+    if not examples.exists():
+        return
+    out = tmp_path / "out"
+    r = run(["python3", "thomson_bundle_converter.py", str(examples), "--project-name", "example", "--output-root", str(out)], root)
+    assert r.returncode == 0
+    report = json.loads((out / "example-conversion-report.json").read_text())
+    assert "validation" in report

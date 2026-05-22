@@ -42,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pretty", action="store_true")
     p.add_argument("--schematic-pdf-dpi", type=int, default=300)
     p.add_argument("--gerber-pdf-dpi", type=int, default=400)
+    p.add_argument("--validate-outputs", action="store_true", help="Run integrated output validation checks")
     return p.parse_args()
 
 
@@ -532,6 +533,79 @@ def render_pdf_images(args: argparse.Namespace, project_root: Path, output_root:
     status["output_validation"] = {"status": "pass"}
     return {"report": status, "warnings": warnings, "errors": errors, "image_outputs": image_outputs}
 
+
+
+def validate_outputs(project_root: Path, output_root: Path, project_name: str, files: list[ClassifiedFile], report: dict[str, Any]) -> dict[str, Any]:
+    issues: list[str] = []
+    json_round_trip_ok = True
+    required_outputs_ok = True
+    image_outputs_ok = True
+
+    report_json = output_root / f"{project_name}-conversion-report.json"
+    report_md = output_root / f"{project_name}-conversion-report.md"
+    if not output_root.exists():
+        issues.append("post_conversion folder missing")
+    if not report_json.exists():
+        issues.append("conversion-report.json missing")
+        required_outputs_ok = False
+    if not report_md.exists():
+        issues.append("conversion-report.md missing")
+        required_outputs_ok = False
+
+    for j in sorted(output_root.glob("*.json")):
+        try:
+            json.loads(j.read_text(encoding="utf-8"))
+        except Exception:
+            json_round_trip_ok = False
+            issues.append(f"json failed round-trip: {j.name}")
+
+    cats={f.category for f in files}
+    expected=[]
+    if "bom_csv_candidate" in cats: expected.append(output_root / f"{project_name}-bom.json")
+    if "pads_ascii_candidate" in cats: expected.append(output_root / f"{project_name}-thomson-export-sch.json")
+    if "ipc2581_candidate" in cats:
+        expected.append(output_root / f"{project_name}-thomson-export-brd.json")
+        expected.append(output_root / f"{project_name}-thomson-export-stack.json")
+    for e in expected:
+        if not e.exists():
+            required_outputs_ok=False
+            issues.append(f"required output missing: {e.name}")
+
+    has_pdf = any(c in cats for c in ["schematic_pdf_candidate","layout_pdf_candidate"])
+    pngs = sorted(output_root.glob("*.png"))
+    if has_pdf and not report.get("images",{}).get("pdftoppm_available",False) and len(pngs)==0:
+        image_outputs_ok=True
+    elif has_pdf and len(pngs)==0:
+        image_outputs_ok=False
+        issues.append("pdf sources present but no png outputs")
+
+    sections_ok = all(k in report for k in ["discovery","bom","schematic","ipc2581","images","warnings"])
+    if not sections_ok:
+        required_outputs_ok = False
+        issues.append("required report sections missing")
+
+    outputs_recorded = all(report.get("bom",{}).get("output_file"),) if False else True
+    # minimal path recording checks
+    if not report.get("bom",{}).get("output_file"):
+        issues.append("bom output path not recorded")
+    if not report.get("schematic",{}).get("output_file"):
+        issues.append("schematic output path not recorded")
+    if not report.get("ipc2581",{}).get("board_output_file"):
+        issues.append("board output path not recorded")
+
+    warnings_count = len(report.get("warnings", []))
+    strict_would_fail = warnings_count > 0
+    ok = json_round_trip_ok and required_outputs_ok and image_outputs_ok
+    return {
+        "ok": ok,
+        "json_round_trip_ok": json_round_trip_ok,
+        "required_outputs_ok": required_outputs_ok,
+        "image_outputs_ok": image_outputs_ok,
+        "warnings_count": warnings_count,
+        "strict_would_fail": strict_would_fail,
+        "ready_for_thomsonlint_smoke_test": ok and (image_outputs_ok or not has_pdf),
+        "issues": issues,
+    }
 def build_report(args: argparse.Namespace, project_root: Path, output_root: Path, project_name: str, files: list[ClassifiedFile], warnings: list[dict[str, Any]], bom: dict[str, Any], pads: dict[str, Any], ipc: dict[str, Any], images: dict[str, Any]) -> dict[str, Any]:
     counts: dict[str, int] = {}
     for f in files:
@@ -540,7 +614,7 @@ def build_report(args: argparse.Namespace, project_root: Path, output_root: Path
     return {
         "metadata": {
             "converter": "thomson_bundle_converter", "version": VERSION, "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-            "project_root": str(project_root), "project_name": project_name, "output_root": str(output_root), "args": vars(args), "phase": "phase3_pads_schematic",
+            "project_root": str(project_root), "project_name": project_name, "output_root": str(output_root), "args": vars(args), "phase": "phase6_integrated_validation",
         },
         "discovery": {"files": [f.__dict__ for f in files], "counts_by_category": counts},
         "bom": {
@@ -567,6 +641,7 @@ def build_report(args: argparse.Namespace, project_root: Path, output_root: Path
         "ipc2581": {"source_file": ipc.get("source_file"), "root": ipc.get("ipc_root"), "revision": ipc.get("ipc_revision"), "namespace": ipc.get("namespace"), "component_count": ipc.get("extraction_counts", {}).get("board_component_count", 0), "placement_count": ipc.get("extraction_counts", {}).get("placement_count", 0), "net_count": ipc.get("extraction_counts", {}).get("board_net_count", 0), "layer_count": ipc.get("extraction_counts", {}).get("layer_count", 0), "stackup_layer_count": ipc.get("extraction_counts", {}).get("stackup_layer_count", 0), "via_count": ipc.get("extraction_counts", {}).get("via_count", 0), "drill_count": ipc.get("extraction_counts", {}).get("drill_count", 0), "route_segment_count": ipc.get("extraction_counts", {}).get("route_segment_count", 0), "outline_point_count": ipc.get("extraction_counts", {}).get("outline_point_count", 0), "parse_warnings": ipc.get("warnings", []), "board_output_file": str(output_root / f"{project_name}-thomson-export-brd.json"), "stack_output_file": str(output_root / f"{project_name}-thomson-export-stack.json"), "board_json_validation": {"status": "skipped" if args.dry_run or args.report_only else "pending"}, "stack_json_validation": {"status": "skipped" if args.dry_run or args.report_only else "pending"}},
         "images": images.get("report", {}),
         "image_outputs": images.get("image_outputs", []),
+        "validation": {},
         "warnings": warnings + bom.get("warnings", []) + pads.get("warnings", []) + ipc.get("warnings", []) + images.get("warnings", []),
         "errors": [],
         "notes": [
@@ -581,13 +656,13 @@ def report_markdown(report: dict[str, Any]) -> str:
     s = report.get("schematic", {})
     b = report.get("bom", {})
     lines = [
-        f"# Conversion Report (Phase 3) - {m['project_name']}", "", "## Metadata",
+        f"# Conversion Report (Phase 6) - {m['project_name']}", "", "## Metadata",
         f"- Converter: {m['converter']} {m['version']}", f"- Generated (UTC): {m['generated_at_utc']}",
         "", "## Discovery Counts",
     ]
     for c, n in sorted(report["discovery"]["counts_by_category"].items()):
         lines.append(f"- {c}: {n}")
-    lines += ["", "## BOM", f"- Source file: `{b.get('source_file')}`", f"- Row count: {b.get('row_count', 0)}", "", "## Schematic (PADS)", f"- Source file: `{s.get('source_file')}`", f"- Detected dialect: {s.get('detected_dialect')}", f"- Components: {s.get('component_count', 0)}", f"- Nets: {s.get('net_count', 0)}", f"- Nodes: {s.get('node_count', 0)}", f"- Schematic JSON validation: {s.get('json_validation', {}).get('status', 'unknown')}", "", "## IPC-2581 / Board", f"- Source file: `{report.get('ipc2581',{}).get('source_file')}`", f"- Root: {report.get('ipc2581',{}).get('root')}", f"- Revision: {report.get('ipc2581',{}).get('revision')}", f"- Namespace present: {bool(report.get('ipc2581',{}).get('namespace'))}", f"- Board components: {report.get('ipc2581',{}).get('component_count',0)}", f"- Layers: {report.get('ipc2581',{}).get('layer_count',0)}", f"- Nets: {report.get('ipc2581',{}).get('net_count',0)}", f"- Stack layers: {report.get('ipc2581',{}).get('stackup_layer_count',0)}", f"- Board JSON validation: {report.get('ipc2581',{}).get('board_json_validation',{}).get('status','unknown')}", f"- Stack JSON validation: {report.get('ipc2581',{}).get('stack_json_validation',{}).get('status','unknown')}", "", "## Images / PDF Render", f"- pdftoppm available: {report.get('images',{}).get('pdftoppm_available')}", f"- Pages converted: {report.get('images',{}).get('pages_converted',0)}", f"- Output validation: {report.get('images',{}).get('output_validation',{}).get('status','unknown')}", "", "## Warnings"]
+    lines += ["", "## BOM", f"- Source file: `{b.get('source_file')}`", f"- Row count: {b.get('row_count', 0)}", "", "## Schematic (PADS)", f"- Source file: `{s.get('source_file')}`", f"- Detected dialect: {s.get('detected_dialect')}", f"- Components: {s.get('component_count', 0)}", f"- Nets: {s.get('net_count', 0)}", f"- Nodes: {s.get('node_count', 0)}", f"- Schematic JSON validation: {s.get('json_validation', {}).get('status', 'unknown')}", "", "## IPC-2581 / Board", f"- Source file: `{report.get('ipc2581',{}).get('source_file')}`", f"- Root: {report.get('ipc2581',{}).get('root')}", f"- Revision: {report.get('ipc2581',{}).get('revision')}", f"- Namespace present: {bool(report.get('ipc2581',{}).get('namespace'))}", f"- Board components: {report.get('ipc2581',{}).get('component_count',0)}", f"- Layers: {report.get('ipc2581',{}).get('layer_count',0)}", f"- Nets: {report.get('ipc2581',{}).get('net_count',0)}", f"- Stack layers: {report.get('ipc2581',{}).get('stackup_layer_count',0)}", f"- Board JSON validation: {report.get('ipc2581',{}).get('board_json_validation',{}).get('status','unknown')}", f"- Stack JSON validation: {report.get('ipc2581',{}).get('stack_json_validation',{}).get('status','unknown')}", "", "## Images / PDF Render", f"- pdftoppm available: {report.get('images',{}).get('pdftoppm_available')}", f"- Pages converted: {report.get('images',{}).get('pages_converted',0)}", f"- Output validation: {report.get('images',{}).get('output_validation',{}).get('status','unknown')}", "", "## Validation", f"- ok: {report.get('validation',{}).get('ok')}", f"- json_round_trip_ok: {report.get('validation',{}).get('json_round_trip_ok')}", f"- required_outputs_ok: {report.get('validation',{}).get('required_outputs_ok')}", f"- image_outputs_ok: {report.get('validation',{}).get('image_outputs_ok')}", f"- strict_would_fail: {report.get('validation',{}).get('strict_would_fail')}", f"- ready_for_thomsonlint_smoke_test: {report.get('validation',{}).get('ready_for_thomsonlint_smoke_test')}", "", "## Warnings"]
     if report["warnings"]:
         for w in report["warnings"]:
             lines.append(f"- {w['code']}: {w['message']}")
@@ -675,7 +750,14 @@ def main() -> int:
             json.dump(report, f, indent=2 if args.pretty else None)
         with report_md.open("w", encoding="utf-8") as f:
             f.write(report_markdown(report))
+        report["validation"] = validate_outputs(project_root, output_root, project_name, files, report)
+        with report_json.open("w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2 if args.pretty else None)
+        with report_md.open("w", encoding="utf-8") as f:
+            f.write(report_markdown(report))
 
+    if args.dry_run:
+        report["validation"] = {"ok": True, "json_round_trip_ok": True, "required_outputs_ok": True, "image_outputs_ok": True, "warnings_count": len(report.get("warnings", [])), "strict_would_fail": len(report.get("warnings", []))>0, "ready_for_thomsonlint_smoke_test": True, "issues": ["dry-run validation placeholder"]}
     print(json.dumps(report, indent=2 if args.pretty else None))
 
     if args.strict and report["warnings"]:
