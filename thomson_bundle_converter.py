@@ -7,13 +7,15 @@ import csv
 import io
 import json
 import re
+import shutil
+import subprocess
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.4.0-phase4"
+VERSION = "0.5.0-phase5"
 BOM_PARSER_VERSION = "bom-v1"
 PADS_PARSER_VERSION = "pads-v1"
 IPC_PARSER_VERSION = "ipc2581-v1"
@@ -38,6 +40,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--report-only", action="store_true")
     p.add_argument("--strict", action="store_true")
     p.add_argument("--pretty", action="store_true")
+    p.add_argument("--schematic-pdf-dpi", type=int, default=300)
+    p.add_argument("--gerber-pdf-dpi", type=int, default=400)
     return p.parse_args()
 
 
@@ -464,7 +468,71 @@ def build_board_export(project_name:str, project_root:Path, ipc:dict[str,Any])->
 
 def build_stack_export(project_name:str, project_root:Path, ipc:dict[str,Any])->dict[str,Any]:
     return {"project_name":project_name,"source":{"project_root":str(project_root),"layout_file":ipc.get('source_file'),"format":"ipc2581"},"parser_version":ipc.get('parser_version'),"units":ipc.get('units'),"layer_stack":ipc.get('stackup_layers',[]),"warnings":ipc.get('warnings',[]),"extraction_counts":{"stackup_layer_count":ipc.get('extraction_counts',{}).get('stackup_layer_count',0),"layer_count":ipc.get('extraction_counts',{}).get('layer_count',0)}}
-def build_report(args: argparse.Namespace, project_root: Path, output_root: Path, project_name: str, files: list[ClassifiedFile], warnings: list[dict[str, Any]], bom: dict[str, Any], pads: dict[str, Any], ipc: dict[str, Any]) -> dict[str, Any]:
+
+
+def render_pdf_images(args: argparse.Namespace, project_root: Path, output_root: Path, project_name: str, files: list[ClassifiedFile]) -> dict[str, Any]:
+    warnings: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    image_outputs: list[str] = []
+    schem_pdfs = sorted([f for f in files if f.category == "schematic_pdf_candidate"], key=lambda x: x.relative_path)
+    layout_pdfs = sorted([f for f in files if f.category == "layout_pdf_candidate"], key=lambda x: x.relative_path)
+    pdftoppm = shutil.which("pdftoppm")
+    pdfinfo = shutil.which("pdfinfo")
+    status = {
+        "pdftoppm_available": bool(pdftoppm),
+        "pdfinfo_available": bool(pdfinfo),
+        "schematic_pdf_sources": [f.relative_path for f in schem_pdfs],
+        "layout_pdf_sources": [f.relative_path for f in layout_pdfs],
+        "dpi": {"schematic": args.schematic_pdf_dpi, "layout": args.gerber_pdf_dpi},
+        "pages_converted": 0,
+        "image_outputs": image_outputs,
+        "classification_warnings": [],
+        "dependency_warnings": [],
+        "render_errors": errors,
+        "skipped_pdfs": [],
+        "output_validation": {"status": "skipped" if args.dry_run or args.report_only else "pending"},
+    }
+    if not pdftoppm:
+        w={"code":"WARN_PDFTOPPM_MISSING","message":"pdftoppm not found. Install with: sudo apt install poppler-utils"}
+        warnings.append(w); status["dependency_warnings"].append(w)
+        return {"report": status, "warnings": warnings, "errors": errors, "image_outputs": image_outputs}
+
+    def convert(pdf_rel: str, prefix: str, dpi: int) -> list[Path]:
+        pdf_path = project_root / pdf_rel
+        out_prefix = output_root / prefix
+        cmd=[pdftoppm, "-png", "-r", str(dpi), str(pdf_path), str(out_prefix)]
+        proc=subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            errors.append({"code":"ERR_PDF_RENDER_FAILED","message":f"Failed rendering {pdf_rel}"})
+            return []
+        return sorted(output_root.glob(f"{prefix}-*.png"))
+
+    if args.dry_run or args.report_only:
+        status["skipped_pdfs"] = [f.relative_path for f in schem_pdfs + layout_pdfs]
+        return {"report": status, "warnings": warnings, "errors": errors, "image_outputs": image_outputs}
+
+    for idx, f in enumerate(schem_pdfs, start=1):
+        prefix = f"{project_name}-img-sch" if len(schem_pdfs)==1 else f"{project_name}-img-sch-s{idx}"
+        rendered = convert(f.relative_path, prefix, args.schematic_pdf_dpi)
+        for n,png in enumerate(rendered, start=1):
+            target = output_root / (f"{project_name}-img-sch-p{n}.png" if len(schem_pdfs)==1 else f"{project_name}-img-sch-s{idx}-p{n}.png")
+            png.rename(target); image_outputs.append(str(target))
+
+    for idx, f in enumerate(layout_pdfs, start=1):
+        prefix = f"{project_name}-img-layout-tmp-f{idx}"
+        rendered = convert(f.relative_path, prefix, args.gerber_pdf_dpi)
+        if len(layout_pdfs) > 1:
+            status["classification_warnings"].append({"code":"WARN_LAYOUT_MULTI_PDF_FALLBACK","message":"Multiple layout PDFs rendered with fallback naming."})
+        for n,png in enumerate(rendered, start=1):
+            target_name = f"{project_name}-img-layout-p{n}.png" if len(layout_pdfs)==1 else f"{project_name}-img-layout-f{idx}-p{n}.png"
+            target = output_root / target_name
+            png.rename(target); image_outputs.append(str(target))
+
+    status["pages_converted"] = len(image_outputs)
+    status["output_validation"] = {"status": "pass"}
+    return {"report": status, "warnings": warnings, "errors": errors, "image_outputs": image_outputs}
+
+def build_report(args: argparse.Namespace, project_root: Path, output_root: Path, project_name: str, files: list[ClassifiedFile], warnings: list[dict[str, Any]], bom: dict[str, Any], pads: dict[str, Any], ipc: dict[str, Any], images: dict[str, Any]) -> dict[str, Any]:
     counts: dict[str, int] = {}
     for f in files:
         counts[f.category] = counts.get(f.category, 0) + 1
@@ -497,10 +565,12 @@ def build_report(args: argparse.Namespace, project_root: Path, output_root: Path
         },
         "planned_outputs": planned_outputs(project_name, output_root),
         "ipc2581": {"source_file": ipc.get("source_file"), "root": ipc.get("ipc_root"), "revision": ipc.get("ipc_revision"), "namespace": ipc.get("namespace"), "component_count": ipc.get("extraction_counts", {}).get("board_component_count", 0), "placement_count": ipc.get("extraction_counts", {}).get("placement_count", 0), "net_count": ipc.get("extraction_counts", {}).get("board_net_count", 0), "layer_count": ipc.get("extraction_counts", {}).get("layer_count", 0), "stackup_layer_count": ipc.get("extraction_counts", {}).get("stackup_layer_count", 0), "via_count": ipc.get("extraction_counts", {}).get("via_count", 0), "drill_count": ipc.get("extraction_counts", {}).get("drill_count", 0), "route_segment_count": ipc.get("extraction_counts", {}).get("route_segment_count", 0), "outline_point_count": ipc.get("extraction_counts", {}).get("outline_point_count", 0), "parse_warnings": ipc.get("warnings", []), "board_output_file": str(output_root / f"{project_name}-thomson-export-brd.json"), "stack_output_file": str(output_root / f"{project_name}-thomson-export-stack.json"), "board_json_validation": {"status": "skipped" if args.dry_run or args.report_only else "pending"}, "stack_json_validation": {"status": "skipped" if args.dry_run or args.report_only else "pending"}},
-        "warnings": warnings + bom.get("warnings", []) + pads.get("warnings", []) + ipc.get("warnings", []),
+        "images": images.get("report", {}),
+        "image_outputs": images.get("image_outputs", []),
+        "warnings": warnings + bom.get("warnings", []) + pads.get("warnings", []) + ipc.get("warnings", []) + images.get("warnings", []),
         "errors": [],
         "notes": [
-            "Phase 1 performs discovery/reporting.", "Phase 2 adds BOM parsing.", "Phase 3 adds PADS schematic parsing and BOM merge.", "Phase 4 adds IPC-2581 board/stack parsing.",
+            "Phase 1 performs discovery/reporting.", "Phase 2 adds BOM parsing.", "Phase 3 adds PADS schematic parsing and BOM merge.", "Phase 4 adds IPC-2581 board/stack parsing.", "Phase 5 adds PDF-to-PNG rendering.",
             "WARNING: tools/kicad-export.py not found in this repository snapshot; schematic shape uses a compatibility-oriented best effort.",
         ],
     }
@@ -517,7 +587,7 @@ def report_markdown(report: dict[str, Any]) -> str:
     ]
     for c, n in sorted(report["discovery"]["counts_by_category"].items()):
         lines.append(f"- {c}: {n}")
-    lines += ["", "## BOM", f"- Source file: `{b.get('source_file')}`", f"- Row count: {b.get('row_count', 0)}", "", "## Schematic (PADS)", f"- Source file: `{s.get('source_file')}`", f"- Detected dialect: {s.get('detected_dialect')}", f"- Components: {s.get('component_count', 0)}", f"- Nets: {s.get('net_count', 0)}", f"- Nodes: {s.get('node_count', 0)}", f"- Schematic JSON validation: {s.get('json_validation', {}).get('status', 'unknown')}", "", "## IPC-2581 / Board", f"- Source file: `{report.get('ipc2581',{}).get('source_file')}`", f"- Root: {report.get('ipc2581',{}).get('root')}", f"- Revision: {report.get('ipc2581',{}).get('revision')}", f"- Namespace present: {bool(report.get('ipc2581',{}).get('namespace'))}", f"- Board components: {report.get('ipc2581',{}).get('component_count',0)}", f"- Layers: {report.get('ipc2581',{}).get('layer_count',0)}", f"- Nets: {report.get('ipc2581',{}).get('net_count',0)}", f"- Stack layers: {report.get('ipc2581',{}).get('stackup_layer_count',0)}", f"- Board JSON validation: {report.get('ipc2581',{}).get('board_json_validation',{}).get('status','unknown')}", f"- Stack JSON validation: {report.get('ipc2581',{}).get('stack_json_validation',{}).get('status','unknown')}", "", "## Warnings"]
+    lines += ["", "## BOM", f"- Source file: `{b.get('source_file')}`", f"- Row count: {b.get('row_count', 0)}", "", "## Schematic (PADS)", f"- Source file: `{s.get('source_file')}`", f"- Detected dialect: {s.get('detected_dialect')}", f"- Components: {s.get('component_count', 0)}", f"- Nets: {s.get('net_count', 0)}", f"- Nodes: {s.get('node_count', 0)}", f"- Schematic JSON validation: {s.get('json_validation', {}).get('status', 'unknown')}", "", "## IPC-2581 / Board", f"- Source file: `{report.get('ipc2581',{}).get('source_file')}`", f"- Root: {report.get('ipc2581',{}).get('root')}", f"- Revision: {report.get('ipc2581',{}).get('revision')}", f"- Namespace present: {bool(report.get('ipc2581',{}).get('namespace'))}", f"- Board components: {report.get('ipc2581',{}).get('component_count',0)}", f"- Layers: {report.get('ipc2581',{}).get('layer_count',0)}", f"- Nets: {report.get('ipc2581',{}).get('net_count',0)}", f"- Stack layers: {report.get('ipc2581',{}).get('stackup_layer_count',0)}", f"- Board JSON validation: {report.get('ipc2581',{}).get('board_json_validation',{}).get('status','unknown')}", f"- Stack JSON validation: {report.get('ipc2581',{}).get('stack_json_validation',{}).get('status','unknown')}", "", "## Images / PDF Render", f"- pdftoppm available: {report.get('images',{}).get('pdftoppm_available')}", f"- Pages converted: {report.get('images',{}).get('pages_converted',0)}", f"- Output validation: {report.get('images',{}).get('output_validation',{}).get('status','unknown')}", "", "## Warnings"]
     if report["warnings"]:
         for w in report["warnings"]:
             lines.append(f"- {w['code']}: {w['message']}")
@@ -543,7 +613,10 @@ def main() -> int:
     ipc = parse_ipc2581(project_root, files)
     brd = build_board_export(project_name, project_root, ipc)
     stack = build_stack_export(project_name, project_root, ipc)
-    report = build_report(args, project_root, output_root, project_name, files, top_warnings, bom, pads, ipc)
+    if not args.dry_run:
+        output_root.mkdir(parents=True, exist_ok=True)
+    images = render_pdf_images(args, project_root, output_root, project_name, files)
+    report = build_report(args, project_root, output_root, project_name, files, top_warnings, bom, pads, ipc, images)
 
     report_json = output_root / f"{project_name}-conversion-report.json"
     report_md = output_root / f"{project_name}-conversion-report.md"
@@ -560,6 +633,8 @@ def main() -> int:
         print(f"[dry-run] - {sch_json}")
         print(f"[dry-run] - {brd_json}")
         print(f"[dry-run] - {stack_json}")
+        for img in images.get("image_outputs", []):
+            print(f"[dry-run] - {img}")
     else:
         output_root.mkdir(parents=True, exist_ok=True)
         if not args.report_only:

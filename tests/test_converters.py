@@ -238,3 +238,32 @@ def test_phase4_real_examples_ipc_smoke_if_present(tmp_path):
     assert r.returncode == 0
     assert (out / "example-thomson-export-brd.json").exists()
     assert (out / "example-thomson-export-stack.json").exists()
+
+def test_phase5_pdf_report_section_and_dryrun(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    proj = tmp_path / "proj"
+    (proj / "pre_conversion" / "schematic").mkdir(parents=True)
+    (proj / "pre_conversion" / "layout").mkdir(parents=True)
+    (proj / "pre_conversion" / "schematic" / "n.asc").write_text("*PADS-PCB*\n*PART*\nCOMP U1\n*NET*\nNET G\nU1.1\n")
+    (proj / "pre_conversion" / "schematic" / "b.csv").write_text("RefDes\nU1\n")
+    (proj / "pre_conversion" / "layout" / "i.xml").write_text("<IPC-2581/>")
+    (proj / "pre_conversion" / "schematic" / "s.pdf").write_bytes(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    out = tmp_path / "out"
+    r = run(["python3", "thomson_bundle_converter.py", str(proj), "--output-root", str(out), "--dry-run", "--report-only"], root)
+    assert r.returncode == 0
+    assert not list(out.glob("*.png"))
+
+
+def test_phase5_real_examples_png_smoke_if_poppler(tmp_path):
+    import shutil
+    if not shutil.which("pdftoppm"):
+        return
+    root = Path(__file__).resolve().parents[1]
+    examples = root / "examples"
+    if not examples.exists():
+        return
+    out = tmp_path / "out"
+    r = run(["python3", "thomson_bundle_converter.py", str(examples), "--project-name", "example", "--output-root", str(out)], root)
+    assert r.returncode == 0
+    report = json.loads((out / "example-conversion-report.json").read_text())
+    assert "images" in report

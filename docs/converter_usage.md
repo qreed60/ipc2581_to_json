@@ -58,3 +58,16 @@ python3 thomson_bundle_converter.py examples --dry-run --report-only
 Notes:
 - Phase 4 adds IPC-2581 layout extraction and writes `<project>-thomson-export-brd.json` and `<project>-thomson-export-stack.json` in non-dry-run, non-report-only mode.
 - Stack output remains a supplemental deterministic artifact when full material data is unavailable.
+
+## Phase 5 PDF-to-PNG rendering integration
+
+```bash
+python3 thomson_bundle_converter.py examples --project-name example --pretty
+python3 thomson_bundle_converter.py examples --project-name example --pretty --strict
+python3 thomson_bundle_converter.py examples --dry-run --report-only
+```
+
+Notes:
+- Phase 5 adds PDF rendering via `pdftoppm`.
+- New options: `--schematic-pdf-dpi` (default 300), `--gerber-pdf-dpi` (default 400).
+- If `pdftoppm` is missing, warning includes install hint: `sudo apt install poppler-utils`.
