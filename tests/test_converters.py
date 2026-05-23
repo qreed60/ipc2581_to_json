@@ -316,6 +316,175 @@ def test_phase6_examples_smoke_validation_if_present(tmp_path):
     assert "validation" in report
 
 
+def test_phase610_review_geometry_summary(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    proj = tmp_path / "proj"
+    (proj / "pre_conversion" / "schematic").mkdir(parents=True)
+    (proj / "pre_conversion" / "layout").mkdir(parents=True)
+    (proj / "pre_conversion" / "schematic" / "net.asc").write_text(
+        "*PADS-PCB*\n*PART*\nCOMP U1\nCOMP J1\n*NET*\n"
+        "NET CAN_RX\nU1.1 J1.1\n"
+        "NET GND\nU1.2 J1.2\n"
+        "NET XY2_CLK_POS\nU1.3 J1.3\n"
+        "NET XY2_CLK_NEG\nU1.4 J1.4\n"
+        "NET CAN_HI\nU1.5 J1.5\n"
+        "NET CAN_LO\nU1.6 J1.6\n"
+    )
+    (proj / "pre_conversion" / "schematic" / "bom.csv").write_text("RefDes\nU1\nJ1\n")
+    (proj / "pre_conversion" / "layout" / "board.xml").write_text(
+        """<IPC-2581>
+          <DictionaryLineDesc units="INCH">
+            <EntryLineDesc id="ROUND_500"><LineDesc lineEnd="ROUND" lineWidth="0.00500"/></EntryLineDesc>
+            <EntryLineDesc id="ROUND_400"><LineDesc lineEnd="ROUND" lineWidth="0.00400"/></EntryLineDesc>
+          </DictionaryLineDesc>
+          <DictionaryFillDesc units="INCH">
+            <EntryFillDesc id="SOLID_FILL"><FillDesc fillProperty="FILL"/></EntryFillDesc>
+          </DictionaryFillDesc>
+          <Layer name="TOP" layerFunction="CONDUCTOR" side="TOP"/>
+          <Layer name="LAYER2" layerFunction="PLANE" side="INTERNAL"/>
+          <Layer name="BOTTOM" layerFunction="CONDUCTOR" side="BOTTOM"/>
+          <Net name="CAN_RX"><PinRef componentRef="U1" pin="1"/></Net>
+          <Net name="GND"><PinRef componentRef="U1" pin="2"/></Net>
+          <Net name="XY2_CLK_POS"><PinRef componentRef="U1" pin="3"/></Net>
+          <Net name="XY2_CLK_NEG"><PinRef componentRef="U1" pin="4"/></Net>
+          <Net name="CAN_HI"><PinRef componentRef="U1" pin="5"/></Net>
+          <Net name="CAN_LO"><PinRef componentRef="U1" pin="6"/></Net>
+          <LayerFeature layerRef="TOP">
+            <Set net="CAN_RX"><Features><Polyline><PolyBegin x="0" y="0"/><PolyStepSegment x="1" y="0"/><LineDescRef id="ROUND_500"/></Polyline><Pad/></Features></Set>
+            <Set net="XY2_CLK_POS"><Features><Polyline><PolyBegin x="0" y="1"/><PolyStepSegment x="1" y="1"/><LineDescRef id="ROUND_400"/></Polyline></Features></Set>
+            <Set net="XY2_CLK_NEG"><Features><Polyline><PolyBegin x="0" y="2"/><PolyStepSegment x="1" y="2"/><LineDescRef id="ROUND_400"/></Polyline></Features></Set>
+            <Set net="CAN_HI"><Features><Polyline><PolyBegin x="0" y="3"/><PolyStepSegment x="1" y="3"/><LineDescRef id="ROUND_500"/></Polyline></Features></Set>
+            <Set net="CAN_LO"><Features><Polyline><PolyBegin x="0" y="4"/><PolyStepSegment x="1" y="4"/><LineDescRef id="ROUND_500"/></Polyline></Features></Set>
+          </LayerFeature>
+          <LayerFeature layerRef="LAYER2">
+            <Set net="GND"><Features><Contour><Polygon><PolyBegin x="0" y="0"/><PolyStepSegment x="5" y="0"/><FillDescRef id="SOLID_FILL"/></Polygon><Cutout><PolyBegin x="1" y="1"/><PolyStepSegment x="2" y="1"/></Cutout></Contour></Features></Set>
+            <Set net="GND"><Features><Contour><Polygon><PolyBegin x="0" y="2"/><PolyStepSegment x="5" y="2"/><FillDescRef id="SOLID_FILL"/></Polygon><Cutout><PolyBegin x="1" y="2"/><PolyStepSegment x="2" y="2"/></Cutout></Contour></Features></Set>
+            <Set net="GND"><Features><Contour><Polygon><PolyBegin x="0" y="3"/><PolyStepSegment x="5" y="3"/><FillDescRef id="SOLID_FILL"/></Polygon><Cutout><PolyBegin x="1" y="3"/><PolyStepSegment x="2" y="3"/></Cutout></Contour></Features></Set>
+          </LayerFeature>
+        </IPC-2581>"""
+    )
+    out = tmp_path / "out"
+    r = run(["python3", "thomson_bundle_converter.py", str(proj), "--output-root", str(out), "--pretty"], root)
+    assert r.returncode == 0
+    brd = json.loads((out / "proj-thomson-export-brd.json").read_text())
+    review = brd["review_geometry_summary"]
+    assert review["geometry_review_limitations"]
+    assert any(n["net"] == "CAN_RX" and "TOP" in n["layers"] for n in review["net_layer_presence"])
+    assert any(p["net"] == "GND" for p in review["plane_candidates"])
+    assert any({"XY2_CLK_POS", "XY2_CLK_NEG"} == set(p["pair"]) or {"CAN_HI", "CAN_LO"} == set(p["pair"]) for p in review["candidate_differential_or_paired_nets"])
+    assert "copper_feature_summary_rows" in brd
+    assert "board_feature_summary_rows" in brd
+    assert brd["routing_geometry"]["routes"]
+    assert brd["routing_geometry"]["polygons"]
+    assert brd["routing_geometry"]["pads"]
+    assert brd["routing_geometry"]["cutouts"]
+    assert brd["routing_geometry_extraction"]["normalized_route_count"] == 5
+    assert brd["routing_geometry_extraction"]["dropped_or_unparsed_feature_count"] == 0
+    assert any(d["id"] == "ROUND_500" and d["width"] == 0.005 for d in brd["line_descriptors"])
+    assert any(d["id"] == "SOLID_FILL" and d["fill_type"] == "solid" for d in brd["fill_descriptors"])
+    can_rx = next(n for n in review["net_routing_summary"] if n["net"] == "CAN_RX")
+    assert can_rx["route_count"] > 0
+    assert "ROUND_500" in can_rx["line_desc_refs"]
+    topology = brd["routing_topology_summary"]
+    assert topology["nets"]
+    assert topology["trace_width_by_net"]
+    assert topology["trace_width_usage_by_layer"]
+    topo_can_rx = next(n for n in topology["nets"] if n["net"] == "CAN_RX")
+    assert topo_can_rx["route_count"] > 0
+    assert topo_can_rx["min_trace_width"] == 0.005
+    assert topo_can_rx["max_trace_width"] == 0.005
+    assert topo_can_rx["is_routing_candidate"] is True
+    assert any("route/polyline on TOP" in e for e in topo_can_rx["geometry_evidence"])
+    can_rx_trace = next(t for t in topology["trace_width_by_net"] if t["net"] == "CAN_RX")
+    assert "ROUND_500" in can_rx_trace["line_desc_refs"]
+    assert can_rx_trace["min_trace_width"] == 0.005
+    assert can_rx_trace["max_trace_width"] == 0.005
+    assert can_rx_trace["route_count"] > 0
+    assert "TOP" in can_rx_trace["layers"]
+    assert any(set(p["pair"]) == {"CAN_HI", "CAN_LO"} for p in topology["paired_net_geometry_comparison"])
+    assert any(c["net"] == "GND" for c in topology["layer_transition_candidates"]) is False
+    assert any(t["net"] == "CAN_RX" and t["route_count"] > 0 for t in brd["trace_width_by_net"])
+    assert any(t["layer"] == "TOP" and t["line_desc_ref"] == "ROUND_500" for t in brd["trace_width_usage_by_layer"])
+    assert any("No true DRC" in w for w in topology["routing_evidence_warnings"])
+    assert brd["extraction_counts"]["route_segment_count"] == 0
+    assert len(brd["routing_geometry"]["routes"]) > 0
+    plane_nets = {p["net"] for p in review["plane_candidates"]}
+    assert "CAN_HI" not in plane_nets
+    assert "CAN_LO" not in plane_nets
+    pair_sets = [set(p["pair"]) for p in review["candidate_differential_or_paired_nets"]]
+    assert {"CAN_HI", "CAN_LO"} in pair_sets
+
+    report = json.loads((out / "proj-conversion-report.json").read_text())
+    ipc_report = report["ipc2581"]
+    assert ipc_report["copper_feature_extraction_enabled"] is True
+    assert ipc_report["layerfeature_count"] == 2
+    assert ipc_report["set_count"] == 8
+    assert ipc_report["polyline_object_count"] == 5
+    assert ipc_report["polygon_object_count"] == 3
+    assert ipc_report["pad_object_count"] == 1
+    assert ipc_report["cutout_object_count"] == 3
+    assert ipc_report["detailed_geometry_truncated"] is False
+    assert ipc_report["routing_topology_summary_enabled"] is True
+    assert ipc_report["routed_net_count"] >= 1
+    assert ipc_report["paired_net_geometry_comparison_count"] >= 1
+    assert ipc_report["trace_width_by_net_count"] == len(topology["trace_width_by_net"])
+    assert ipc_report["trace_width_usage_by_layer_count"] == len(topology["trace_width_usage_by_layer"])
+    assert ipc_report["routing_evidence_warning_count"] >= 1
+
+
+def test_phase611_real_examples_routing_geometry_if_present(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    examples = root / "examples"
+    if not examples.exists():
+        return
+    out = tmp_path / "out"
+    r = run(["python3", "thomson_bundle_converter.py", str(examples), "--project-name", "example", "--output-root", str(out), "--pretty"], root)
+    assert r.returncode == 0
+    brd = json.loads((out / "example-thomson-export-brd.json").read_text())
+    routing = brd["routing_geometry"]
+    review = brd["review_geometry_summary"]
+    assert routing["routes"]
+    assert routing["polygons"]
+    assert routing["pads"]
+    assert brd["routing_geometry_extraction"]["dropped_or_unparsed_feature_count"] == 0
+    assert brd["line_descriptors"]
+    assert any(d["id"] == "ROUND_500" for d in brd["line_descriptors"])
+    can_rx = next(n for n in review["net_routing_summary"] if n["net"] == "CAN_RX")
+    assert can_rx["route_count"] > 0
+    assert "ROUND_500" in can_rx["line_desc_refs"]
+    topology = brd["routing_topology_summary"]
+    assert topology["trace_width_by_net"]
+    assert topology["trace_width_usage_by_layer"]
+    topo_can_rx = next(n for n in topology["nets"] if n["net"] == "CAN_RX")
+    assert topo_can_rx["route_count"] > 0
+    assert topo_can_rx["min_trace_width"] is not None
+    assert topo_can_rx["max_trace_width"] is not None
+    can_rx_trace = next(t for t in topology["trace_width_by_net"] if t["net"] == "CAN_RX")
+    assert "ROUND_500" in can_rx_trace["line_desc_refs"]
+    assert can_rx_trace["min_trace_width"] == 0.005
+    assert can_rx_trace["max_trace_width"] == 0.005
+    assert any(set(p["pair"]) == {"CAN_HI", "CAN_LO"} for p in topology["paired_net_geometry_comparison"])
+    assert any(c["net"] == "GND" for c in topology["layer_transition_candidates"])
+    assert any(t["net"] == "CAN_RX" for t in brd["trace_width_by_net"])
+    assert any("Geometry comes from IPC-2581" in w for w in topology["routing_evidence_warnings"])
+    assert brd["extraction_counts"]["route_segment_count"] == 0
+    assert len(routing["routes"]) > 0
+    plane_nets = {p["net"] for p in review["plane_candidates"]}
+    assert "GND" in plane_nets
+    assert ("V3P3" in plane_nets) or ("V5P0" in plane_nets)
+    assert "CAN_HI" not in plane_nets
+    assert "CAN_LO" not in plane_nets
+    assert "AUXSPI_CLK" not in plane_nets
+    pair_sets = [set(p["pair"]) for p in review["candidate_differential_or_paired_nets"]]
+    assert {"CAN_HI", "CAN_LO"} in pair_sets
+    assert brd["geometry_review_limitations"]
+
+    report = json.loads((out / "example-conversion-report.json").read_text())
+    ipc_report = report["ipc2581"]
+    assert ipc_report["trace_width_by_net_count"] == len(topology["trace_width_by_net"])
+    assert ipc_report["trace_width_usage_by_layer_count"] == len(topology["trace_width_usage_by_layer"])
+
+
 def test_phase66_pads_multinode_line_and_numbered_mfg_headers(tmp_path):
     root = Path(__file__).resolve().parents[1]
     proj = tmp_path / "proj"

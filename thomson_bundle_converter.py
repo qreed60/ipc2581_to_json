@@ -6,6 +6,7 @@ import argparse
 import csv
 import io
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -19,6 +20,15 @@ VERSION = "0.5.0-phase5"
 BOM_PARSER_VERSION = "bom-v1"
 PADS_PARSER_VERSION = "pads-v1"
 IPC_PARSER_VERSION = "ipc2581-v1"
+GEOMETRY_REVIEW_LIMITATIONS = [
+    "No true clearance DRC performed",
+    "No polygon boolean connectivity verification performed",
+    "Line width references are reported but not validated against design rules unless explicit rules are provided",
+    "Differential/paired nets are name-based candidates only",
+    "Geometry is extracted from IPC-2581 manufacturing/export features, not from live CAD constraints",
+    "No net-short or spacing verification is performed",
+    "Plane candidate detection is heuristic and evidence-based",
+]
 
 
 @dataclass
@@ -428,6 +438,984 @@ def _local(tag: str) -> str:
     return tag.rsplit('}', 1)[-1] if '}' in tag else tag
 
 
+def _upper(v: Any) -> str:
+    return str(v or "").upper()
+
+
+def _is_copper_layer(layer: dict[str, Any]) -> bool:
+    function = _upper(layer.get("function") or layer.get("type"))
+    name = _upper(layer.get("name"))
+    return function in {"CONDUCTOR", "PLANE", "SIGNAL", "INTERNAL"} or name in {"TOP", "BOTTOM"} or bool(re.fullmatch(r"LAYER\d+", name))
+
+
+def _layer_role(layer: dict[str, Any]) -> str:
+    side = _upper(layer.get("side"))
+    name = _upper(layer.get("name"))
+    if side in {"TOP", "BOTTOM", "INTERNAL"}:
+        return side.lower()
+    if name == "TOP":
+        return "top"
+    if name == "BOTTOM":
+        return "bottom"
+    if re.fullmatch(r"LAYER\d+", name):
+        return "internal"
+    return "other"
+
+
+def _net_name_evidence(net: str) -> str | None:
+    n = _upper(net)
+    if n in {"GND", "GROUND", "AGND", "DGND", "PGND", "GNDA", "GNDD"} or n.endswith("_GND"):
+        return "ground net name"
+    if re.search(r"(^VCC|^VDD|^VBAT|^VIN|^VOUT|^\+\d|^PWR|_PWR$|_VCC$|_VDD$)", n):
+        return "power net name"
+    return None
+
+
+def _to_float(v: Any) -> float | None:
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _attrs(e: ET.Element | None) -> dict[str, Any]:
+    return dict(e.attrib) if e is not None else {}
+
+
+def _first_child(e: ET.Element, names: set[str]) -> ET.Element | None:
+    return next((c for c in e if _local(c.tag) in names), None)
+
+
+def _first_desc(e: ET.Element, names: set[str]) -> ET.Element | None:
+    return next((c for c in e.iter() if c is not e and _local(c.tag) in names), None)
+
+
+def _descriptor_ref(e: ET.Element, tag_name: str) -> str | None:
+    ref = next((x.attrib.get("id") for x in e.iter() if _local(x.tag) == tag_name and x.attrib.get("id")), None)
+    return ref
+
+
+def _points_from_geometry(e: ET.Element) -> tuple[list[dict[str, Any]], bool]:
+    points: list[dict[str, Any]] = []
+    has_curve = False
+    for p in e.iter():
+        tag = _local(p.tag)
+        if tag not in {"PolyBegin", "PolyStepSegment", "PolyStepCurve"}:
+            continue
+        x = _to_float(p.attrib.get("x"))
+        y = _to_float(p.attrib.get("y"))
+        if x is None or y is None:
+            continue
+        if tag == "PolyBegin":
+            point = {"kind": "begin", "x": x, "y": y}
+        elif tag == "PolyStepCurve":
+            has_curve = True
+            point = {
+                "kind": "curve",
+                "x": x,
+                "y": y,
+                "center_x": _to_float(p.attrib.get("centerX") or p.attrib.get("center_x")),
+                "center_y": _to_float(p.attrib.get("centerY") or p.attrib.get("center_y")),
+                "clockwise": (p.attrib.get("clockwise") or "").lower() == "true",
+            }
+        else:
+            point = {"kind": "segment", "x": x, "y": y}
+        points.append(point)
+    return points, has_curve
+
+
+def _route_length_from_points(points: list[dict[str, Any]]) -> dict[str, Any]:
+    total = 0.0
+    segment_count = 0
+    curve_count = 0
+    estimated = False
+    prev: dict[str, Any] | None = None
+    for point in points:
+        if prev is None:
+            prev = point
+            continue
+        x1 = prev.get("x")
+        y1 = prev.get("y")
+        x2 = point.get("x")
+        y2 = point.get("y")
+        if not all(isinstance(v, (int, float)) for v in (x1, y1, x2, y2)):
+            prev = point
+            continue
+        chord = math.hypot(x2 - x1, y2 - y1)
+        if point.get("kind") == "curve":
+            curve_count += 1
+            cx = point.get("center_x")
+            cy = point.get("center_y")
+            if isinstance(cx, (int, float)) and isinstance(cy, (int, float)):
+                radius_a = math.hypot(x1 - cx, y1 - cy)
+                radius_b = math.hypot(x2 - cx, y2 - cy)
+                radius = (radius_a + radius_b) / 2.0
+                if radius > 0:
+                    start = math.atan2(y1 - cy, x1 - cx)
+                    end = math.atan2(y2 - cy, x2 - cx)
+                    if point.get("clockwise"):
+                        angle = (start - end) % (2.0 * math.pi)
+                    else:
+                        angle = (end - start) % (2.0 * math.pi)
+                    total += radius * angle
+                else:
+                    total += chord
+                    estimated = True
+            else:
+                total += chord
+                estimated = True
+        else:
+            segment_count += 1
+            total += chord
+        prev = point
+    return {
+        "length": round(total, 10),
+        "length_units": "INCH",
+        "length_is_estimated": estimated,
+        "segment_count": segment_count,
+        "curve_count": curve_count,
+    }
+
+
+def _bbox_from_points(points: list[dict[str, Any]]) -> dict[str, float] | None:
+    xs = [p["x"] for p in points if isinstance(p.get("x"), (int, float))]
+    ys = [p["y"] for p in points if isinstance(p.get("y"), (int, float))]
+    if not xs or not ys:
+        return None
+    return {"min_x": min(xs), "min_y": min(ys), "max_x": max(xs), "max_y": max(ys)}
+
+
+def _merge_bbox(a: dict[str, float] | None, b: dict[str, float] | None) -> dict[str, float] | None:
+    if not a:
+        return b
+    if not b:
+        return a
+    return {
+        "min_x": min(a["min_x"], b["min_x"]),
+        "min_y": min(a["min_y"], b["min_y"]),
+        "max_x": max(a["max_x"], b["max_x"]),
+        "max_y": max(a["max_y"], b["max_y"]),
+    }
+
+
+def _bbox_area(bbox: dict[str, float] | None) -> float:
+    if not bbox:
+        return 0.0
+    return max(0.0, bbox["max_x"] - bbox["min_x"]) * max(0.0, bbox["max_y"] - bbox["min_y"])
+
+
+def _bbox_overlap_possible(a: dict[str, float] | None, b: dict[str, float] | None) -> bool | None:
+    if not a or not b:
+        return None
+    return not (a["max_x"] < b["min_x"] or b["max_x"] < a["min_x"] or a["max_y"] < b["min_y"] or b["max_y"] < a["min_y"])
+
+
+def _count_phrase(count: int, singular: str, plural: str, layer: str) -> str:
+    noun = singular if count == 1 else plural
+    return f"{count} {noun} on {layer}"
+
+
+def _parse_line_descriptors(root: ET.Element, default_units: str | None) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    rows: list[dict[str, Any]] = []
+    for entry in root.iter():
+        if _local(entry.tag) not in {"EntryLineDesc", "LineDescEntry"}:
+            continue
+        desc = _first_desc(entry, {"LineDesc"})
+        ident = entry.attrib.get("id") or (desc.attrib.get("id") if desc is not None else None)
+        if not ident:
+            continue
+        dictionary = next((p for p in root.iter() if _local(p.tag) == "DictionaryLineDesc" and entry in list(p)), None)
+        units = entry.attrib.get("units") or (desc.attrib.get("units") if desc is not None else None) or (dictionary.attrib.get("units") if dictionary is not None else None) or default_units
+        raw = {"entry": _attrs(entry), "line_desc": _attrs(desc)}
+        rows.append({
+            "id": ident,
+            "width": _to_float((desc.attrib.get("lineWidth") if desc is not None else None) or entry.attrib.get("lineWidth") or entry.attrib.get("width")),
+            "units": units,
+            "shape": (desc.attrib.get("lineEnd") if desc is not None else None) or entry.attrib.get("lineEnd") or entry.attrib.get("shape"),
+            "raw": raw,
+        })
+    if not rows:
+        for desc in root.iter():
+            if _local(desc.tag) != "LineDesc" or not desc.attrib.get("id"):
+                continue
+            rows.append({
+                "id": desc.attrib.get("id"),
+                "width": _to_float(desc.attrib.get("lineWidth") or desc.attrib.get("width")),
+                "units": desc.attrib.get("units") or default_units,
+                "shape": desc.attrib.get("lineEnd") or desc.attrib.get("shape"),
+                "raw": {"line_desc": _attrs(desc)},
+            })
+    rows = sorted(rows, key=lambda r: r["id"])
+    return rows, {r["id"]: r for r in rows}
+
+
+def _parse_fill_descriptors(root: ET.Element, default_units: str | None) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    rows: list[dict[str, Any]] = []
+    for entry in root.iter():
+        if _local(entry.tag) not in {"EntryFillDesc", "FillDescEntry"}:
+            continue
+        desc = _first_desc(entry, {"FillDesc"})
+        ident = entry.attrib.get("id") or (desc.attrib.get("id") if desc is not None else None)
+        if not ident:
+            continue
+        fill_prop = ((desc.attrib.get("fillProperty") if desc is not None else None) or entry.attrib.get("fillProperty") or entry.attrib.get("fill_type") or "").lower()
+        rows.append({
+            "id": ident,
+            "fill_type": "solid" if fill_prop == "fill" else (fill_prop or None),
+            "units": entry.attrib.get("units") or (desc.attrib.get("units") if desc is not None else None) or default_units,
+            "raw": {"entry": _attrs(entry), "fill_desc": _attrs(desc)},
+        })
+    rows = sorted(rows, key=lambda r: r["id"])
+    return rows, {r["id"]: r for r in rows}
+
+
+def _make_layer_presence_entry(net: str, layer_map: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    ordered_layers = {}
+    totals = {"polylines": 0, "polygons": 0, "pads": 0, "cutouts": 0}
+    for layer in sorted(layer_map):
+        item = layer_map[layer]
+        ordered = {
+            "polylines": item.get("polylines", 0),
+            "polygons": item.get("polygons", 0),
+            "pads": item.get("pads", 0),
+            "cutouts": item.get("cutouts", 0),
+            "line_desc_refs": sorted(item.get("line_desc_refs", [])),
+            "fill_desc_refs": sorted(item.get("fill_desc_refs", [])),
+        }
+        ordered_layers[layer] = ordered
+        for k in totals:
+            totals[k] += ordered[k]
+    return {
+        "net": net,
+        "layers": ordered_layers,
+        "total_polylines": totals["polylines"],
+        "total_polygons": totals["polygons"],
+        "total_pads": totals["pads"],
+        "total_cutouts": totals["cutouts"],
+    }
+
+
+def _candidate_pairs(net_names: set[str], nets_with_geometry: set[str]):
+    pairs: dict[tuple[str, str], str] = {}
+    by_upper = {_upper(n): n for n in net_names}
+
+    suffix_rules = [
+        ("_P", "_N", "name suffix P/N"),
+        ("_POS", "_NEG", "name suffix POS/NEG"),
+    ]
+    for net in sorted(net_names):
+        upper = _upper(net)
+        for pos, neg, reason in suffix_rules:
+            if upper.endswith(pos):
+                mate = upper[: -len(pos)] + neg
+            elif upper.endswith(neg):
+                mate = upper[: -len(neg)] + pos
+            else:
+                continue
+            if mate in by_upper:
+                pair = tuple(sorted((net, by_upper[mate])))
+                pairs[pair] = reason
+
+    can_hi = by_upper.get("CAN_HI")
+    can_lo = by_upper.get("CAN_LO")
+    if can_hi and can_lo:
+        pairs[tuple(sorted((can_hi, can_lo)))] = "CAN HI/LO naming"
+
+    for pair in sorted(pairs):
+        reason = pairs[pair]
+        if "CLK" in _upper(pair[0]) or "CLK" in _upper(pair[1]):
+            reason = f"{reason}; CLK naming"
+        if "XY2" in _upper(pair[0]) or "XY2" in _upper(pair[1]):
+            reason = f"{reason}; XY2 naming"
+        yield {
+            "pair": list(pair),
+            "reason": reason,
+            "geometry_available": bool(set(pair) & nets_with_geometry),
+        }
+
+
+def _build_routing_topology_summary(
+    *,
+    units: str | None,
+    nets: list[dict[str, Any]],
+    layers: list[dict[str, Any]],
+    per_net_layer: dict[str, dict[str, dict[str, Any]]],
+    geom_by_net: dict[str, dict[str, Any]],
+    review_summary: dict[str, Any],
+    routes: list[dict[str, Any]],
+    legacy_route_segment_count: int = 0,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    layer_by_name = {l.get("name"): l for l in layers if l.get("name")}
+    plane_nets = {p.get("net") for p in review_summary.get("plane_candidates", []) if p.get("net")}
+    pad_only_nets = {p.get("net") for p in review_summary.get("pad_only_nets", []) if p.get("net")}
+    routing_nets = {p.get("net") for p in review_summary.get("routing_candidates", []) if p.get("net")}
+    logical_net_names = {n.get("name") for n in nets if n.get("name")}
+    all_net_names = sorted(logical_net_names | set(geom_by_net))
+
+    trace_width_by_net = []
+    route_length_net_map: dict[str, dict[str, Any]] = {}
+    route_length_layer_map: dict[str | None, dict[str, Any]] = {}
+    for route in routes:
+        if route.get("feature_domain") != "copper":
+            continue
+        length = route.get("length")
+        if not isinstance(length, (int, float)):
+            continue
+        net = route.get("net")
+        layer = route.get("layer")
+        estimated = bool(route.get("length_is_estimated"))
+        if net:
+            net_row = route_length_net_map.setdefault(net, {"net": net, "total_route_length": 0.0, "length_units": "INCH", "route_count": 0, "layers": set(), "length_is_estimated": False, "estimated_route_count": 0, "curve_count": 0, "route_lengths": []})
+            net_row["total_route_length"] += length
+            net_row["route_count"] += 1
+            net_row["route_lengths"].append(length)
+            if layer:
+                net_row["layers"].add(layer)
+            net_row["length_is_estimated"] = net_row["length_is_estimated"] or estimated
+            net_row["estimated_route_count"] += 1 if estimated else 0
+            net_row["curve_count"] += int(route.get("curve_count") or 0)
+        layer_row = route_length_layer_map.setdefault(layer, {"layer": layer, "total_route_length": 0.0, "length_units": "INCH", "route_count": 0, "nets": set(), "estimated_route_count": 0})
+        layer_row["total_route_length"] += length
+        layer_row["route_count"] += 1
+        layer_row["estimated_route_count"] += 1 if estimated else 0
+        if net:
+            layer_row["nets"].add(net)
+
+    route_length_by_net = []
+    for item in sorted(route_length_net_map.values(), key=lambda r: r["net"]):
+        lengths = item.pop("route_lengths")
+        route_length_by_net.append({
+            **item,
+            "total_route_length": round(item["total_route_length"], 10),
+            "layers": sorted(item["layers"]),
+            "min_route_length": round(min(lengths), 10) if lengths else None,
+            "max_route_length": round(max(lengths), 10) if lengths else None,
+        })
+    route_length_by_layer = [
+        {
+            **item,
+            "total_route_length": round(item["total_route_length"], 10),
+            "net_count": len(item["nets"]),
+            "nets": sorted(item["nets"]),
+        }
+        for item in sorted(route_length_layer_map.values(), key=lambda r: str(r["layer"]))
+    ]
+    route_length_by_net_map = {row["net"]: row for row in route_length_by_net}
+
+    topology_nets = []
+    presence_by_net = {p.get("net"): p for p in review_summary.get("net_layer_presence", []) if p.get("net")}
+    for net in all_net_names:
+        item = geom_by_net.get(net, {"routes": 0, "polygons": 0, "pads": 0, "cutouts": 0, "layers": set(), "line_desc_refs": set(), "widths": [], "bbox": None})
+        widths = item.get("widths") or []
+        layer_set = sorted(item.get("layers") or [])
+        roles = {_layer_role(layer_by_name.get(layer, {"name": layer})) for layer in layer_set}
+        line_refs = sorted(item.get("line_desc_refs") or [])
+        evidence: list[str] = []
+        for layer, counts in sorted(per_net_layer.get(net, {}).items()):
+            if not _is_copper_layer(layer_by_name.get(layer, {"name": layer})):
+                continue
+            if counts.get("polylines"):
+                evidence.append(_count_phrase(counts["polylines"], "route/polyline", "routes/polylines", layer))
+            if counts.get("polygons"):
+                evidence.append(_count_phrase(counts["polygons"], "polygon", "polygons", layer))
+            if counts.get("pads"):
+                evidence.append(_count_phrase(counts["pads"], "pad", "pads", layer))
+            if counts.get("cutouts"):
+                evidence.append(_count_phrase(counts["cutouts"], "cutout", "cutouts", layer))
+        if line_refs:
+            evidence.append(f"trace width refs: {', '.join(line_refs)}")
+        row = {
+            "net": net,
+            "layers": layer_set,
+            "route_count": item.get("routes", 0),
+            "polygon_count": item.get("polygons", 0),
+            "pad_count": item.get("pads", 0),
+            "cutout_count": item.get("cutouts", 0),
+            "line_desc_refs": line_refs,
+            "min_trace_width": min(widths) if widths else None,
+            "max_trace_width": max(widths) if widths else None,
+            "bbox": item.get("bbox"),
+            "has_top_copper": "top" in roles,
+            "has_bottom_copper": "bottom" in roles,
+            "has_internal_copper": "internal" in roles,
+            "has_plane_evidence": net in plane_nets,
+            "is_plane_candidate": net in plane_nets,
+            "is_pad_only": net in pad_only_nets,
+            "is_routing_candidate": net in routing_nets or item.get("routes", 0) > 0,
+            "geometry_evidence": evidence,
+        }
+        topology_nets.append(row)
+        if row["route_count"] > 0:
+            trace_width_by_net.append({
+                "net": net,
+                "line_desc_refs": row["line_desc_refs"],
+                "min_trace_width": row["min_trace_width"],
+                "max_trace_width": row["max_trace_width"],
+                "route_count": row["route_count"],
+                "layers": row["layers"],
+            })
+
+    topology_by_net = {row["net"]: row for row in topology_nets}
+    paired_comparisons = []
+    for pair in review_summary.get("candidate_differential_or_paired_nets", []):
+        names = pair.get("pair") or []
+        if len(names) != 2:
+            continue
+        a = topology_by_net.get(names[0])
+        b = topology_by_net.get(names[1])
+        if not a or not b:
+            continue
+        net_a = {
+            "net": a["net"],
+            "layers": a["layers"],
+            "route_count": a["route_count"],
+            "polygon_count": a["polygon_count"],
+            "pad_count": a["pad_count"],
+            "min_trace_width": a["min_trace_width"],
+            "max_trace_width": a["max_trace_width"],
+            "bbox": a["bbox"],
+            "line_desc_refs": a["line_desc_refs"],
+            "total_route_length": route_length_by_net_map.get(a["net"], {}).get("total_route_length"),
+            "length_units": route_length_by_net_map.get(a["net"], {}).get("length_units"),
+        }
+        net_b = {
+            "net": b["net"],
+            "layers": b["layers"],
+            "route_count": b["route_count"],
+            "polygon_count": b["polygon_count"],
+            "pad_count": b["pad_count"],
+            "min_trace_width": b["min_trace_width"],
+            "max_trace_width": b["max_trace_width"],
+            "bbox": b["bbox"],
+            "line_desc_refs": b["line_desc_refs"],
+            "total_route_length": route_length_by_net_map.get(b["net"], {}).get("total_route_length"),
+            "length_units": route_length_by_net_map.get(b["net"], {}).get("length_units"),
+        }
+        length_a = net_a["total_route_length"]
+        length_b = net_b["total_route_length"]
+        length_delta = abs(length_a - length_b) if isinstance(length_a, (int, float)) and isinstance(length_b, (int, float)) else None
+        length_ratio = (length_a / length_b) if isinstance(length_a, (int, float)) and isinstance(length_b, (int, float)) and length_b else None
+        length_estimated = bool(route_length_by_net_map.get(a["net"], {}).get("length_is_estimated") or route_length_by_net_map.get(b["net"], {}).get("length_is_estimated"))
+        paired_comparisons.append({
+            "pair": names,
+            "reason": pair.get("reason"),
+            "geometry_available": bool(a["layers"] or b["layers"]),
+            "net_a": net_a,
+            "net_b": net_b,
+            "comparison": {
+                "same_layer_set": a["layers"] == b["layers"],
+                "same_trace_width_refs": a["line_desc_refs"] == b["line_desc_refs"],
+                "route_count_delta": abs(a["route_count"] - b["route_count"]),
+                "polygon_count_delta": abs(a["polygon_count"] - b["polygon_count"]),
+                "pad_count_delta": abs(a["pad_count"] - b["pad_count"]),
+                "bbox_overlap_possible": _bbox_overlap_possible(a["bbox"], b["bbox"]),
+                "route_length_a": length_a,
+                "route_length_b": length_b,
+                "route_length_delta": round(length_delta, 10) if isinstance(length_delta, (int, float)) else None,
+                "route_length_delta_units": "INCH" if isinstance(length_delta, (int, float)) else None,
+                "route_length_ratio": round(length_ratio, 10) if isinstance(length_ratio, (int, float)) else None,
+                "length_is_estimated": length_estimated,
+            },
+            "review_note": "Name-based candidate pair only; route lengths are IPC-2581 geometry estimates and no impedance, coupling, spacing, skew, timing, or length matching has been verified.",
+        })
+
+    layer_transition_candidates = []
+    for row in topology_nets:
+        if len(row["layers"]) <= 1:
+            continue
+        feature_count = row["route_count"] + row["polygon_count"] + row["pad_count"] + row["cutout_count"]
+        if feature_count == 0:
+            continue
+        layer_transition_candidates.append({
+            "net": row["net"],
+            "reason": "net has copper evidence on multiple copper layers",
+            "layers": row["layers"],
+            "pad_count": row["pad_count"],
+            "route_count": row["route_count"],
+            "polygon_count": row["polygon_count"],
+            "cutout_count": row["cutout_count"],
+        })
+
+    trace_width_by_layer_map: dict[tuple[str | None, str | None, float | None, str | None], dict[str, Any]] = {}
+    for route in routes:
+        if route.get("feature_domain") != "copper":
+            continue
+        key = (route.get("layer"), route.get("line_desc_ref"), route.get("line_width"), route.get("line_width_units"))
+        row = trace_width_by_layer_map.setdefault(key, {"layer": key[0], "line_desc_ref": key[1], "line_width": key[2], "units": key[3], "route_count": 0, "nets": set()})
+        row["route_count"] += 1
+        if route.get("net"):
+            row["nets"].add(route["net"])
+    trace_width_usage_by_layer = [
+        {**row, "nets": sorted(row["nets"])}
+        for row in sorted(trace_width_by_layer_map.values(), key=lambda r: (str(r["layer"]), str(r["line_desc_ref"]), r["line_width"] is None, r["line_width"] or 0.0))
+    ]
+
+    warnings = []
+    if pad_only_nets:
+        warnings.append(f"{len(pad_only_nets)} pad-only nets exist in extracted IPC-2581 geometry")
+    if paired_comparisons:
+        warnings.append("Paired net candidates are name-based only; no impedance, coupling, spacing, skew, or length matching has been verified")
+    warnings.extend([
+        "Route length is computed from IPC-2581 exported geometry, not live CAD constraints",
+        "Length comparison is not impedance, skew, timing, or differential-pair validation",
+        "No true DRC, net-short, or spacing verification is performed by the converter",
+        "Stackup thickness/material may be unavailable or incomplete in IPC-2581 source data",
+        "Geometry comes from IPC-2581 manufacturing/export features, not live CAD constraints",
+    ])
+    if any((route.get("curve_count") or 0) for route in routes):
+        warnings.append("Arc/curve lengths may be estimated where exact curve semantics are limited")
+    if legacy_route_segment_count == 0 and routes:
+        warnings.append("Legacy route_segment_count is 0, but normalized routing_geometry.routes is available")
+
+    summary = {
+        "units": units,
+        "net_count": len(all_net_names),
+        "routed_net_count": sum(1 for row in topology_nets if row["route_count"] > 0),
+        "pad_only_net_count": len(pad_only_nets),
+        "plane_candidate_count": len(plane_nets),
+        "paired_net_candidate_count": len(review_summary.get("candidate_differential_or_paired_nets", [])),
+        "nets": topology_nets,
+        "paired_net_geometry_comparison": paired_comparisons,
+        "layer_transition_candidates": layer_transition_candidates,
+        "trace_width_by_net": trace_width_by_net,
+        "trace_width_usage_by_layer": trace_width_usage_by_layer,
+        "route_length_by_net": route_length_by_net,
+        "route_length_by_layer": route_length_by_layer,
+        "routing_evidence_warnings": warnings,
+        "limitations": [
+            "Layer transition rows are candidates only; actual via connectivity is not proven unless explicit via/hole association is available.",
+            "Route lengths are approximate IPC-2581 geometry summaries and are not live CAD constraint, timing, or skew verification.",
+            "Paired-net comparisons summarize extracted geometry only and do not validate impedance, coupling, spacing, skew, timing, or length matching.",
+            "Topology summaries are evidence summaries, not DRC, LVS, connectivity, or fabrication-rule verification.",
+        ],
+    }
+    return summary, trace_width_by_net, trace_width_usage_by_layer, route_length_by_net, route_length_by_layer
+
+
+def extract_layerfeature_geometry(root: ET.Element, layers: list[dict[str, Any]], nets: list[dict[str, Any]], units: str | None = None) -> dict[str, Any]:
+    layer_by_name = {l.get("name"): l for l in layers if l.get("name")}
+    copper_layer_names = {name for name, layer in layer_by_name.items() if _is_copper_layer(layer)}
+    line_descriptors, line_desc_by_id = _parse_line_descriptors(root, units)
+    fill_descriptors, fill_desc_by_id = _parse_fill_descriptors(root, units)
+
+    per_net_layer: dict[str, dict[str, dict[str, Any]]] = {}
+    layer_totals: dict[str, dict[str, Any]] = {}
+    line_ref_usage: dict[str, int] = {}
+    fill_ref_usage: dict[str, int] = {}
+    copper_features: list[dict[str, Any]] = []
+    board_feature_summary_rows: list[dict[str, Any]] = []
+    routes: list[dict[str, Any]] = []
+    polygons: list[dict[str, Any]] = []
+    pads: list[dict[str, Any]] = []
+    cutouts: list[dict[str, Any]] = []
+    parse_warnings: list[dict[str, Any]] = []
+    layerfeature_count = 0
+    set_count = 0
+    object_counts = {"polylines": 0, "polygons": 0, "pads": 0, "cutouts": 0}
+    non_copper_counts = {"polylines": 0, "polygons": 0, "pads": 0, "cutouts": 0}
+    route_id = polygon_id = pad_id = cutout_id = 0
+
+    for lf in root.iter():
+        if _local(lf.tag) != "LayerFeature":
+            continue
+        layerfeature_count += 1
+        layer = lf.attrib.get("layerRef") or lf.attrib.get("layer") or lf.attrib.get("name") or "unknown_layer"
+        if layer not in layer_by_name:
+            layer_by_name[layer] = {"name": layer, "type": None, "function": None, "side": None}
+            if _is_copper_layer(layer_by_name[layer]):
+                copper_layer_names.add(layer)
+        layer_summary = layer_totals.setdefault(layer, {"layer": layer, "sets": 0, "polylines": 0, "polygons": 0, "pads": 0, "cutouts": 0, "nets": set()})
+        for set_elem in [c for c in lf if _local(c.tag) == "Set"]:
+            set_count += 1
+            layer_summary["sets"] += 1
+            net = set_elem.attrib.get("net") or set_elem.attrib.get("netRef") or set_elem.attrib.get("netName") or None
+            counts = {
+                "polylines": sum(1 for x in set_elem.iter() if _local(x.tag) == "Polyline"),
+                "polygons": sum(1 for x in set_elem.iter() if _local(x.tag) == "Polygon"),
+                "pads": sum(1 for x in set_elem.iter() if _local(x.tag) == "Pad"),
+                "cutouts": sum(1 for x in set_elem.iter() if _local(x.tag) == "Cutout"),
+            }
+            contour_count = sum(1 for x in set_elem.iter() if _local(x.tag) == "Contour")
+            line_refs = sorted({x.attrib.get("id") for x in set_elem.iter() if _local(x.tag) == "LineDescRef" and x.attrib.get("id")})
+            fill_refs = sorted({x.attrib.get("id") for x in set_elem.iter() if _local(x.tag) == "FillDescRef" and x.attrib.get("id")})
+            for key, value in counts.items():
+                object_counts[key] += value
+                layer_summary[key] += value
+                if layer not in copper_layer_names:
+                    non_copper_counts[key] += value
+            for ref in line_refs:
+                line_ref_usage[ref] = line_ref_usage.get(ref, 0) + 1
+            for ref in fill_refs:
+                fill_ref_usage[ref] = fill_ref_usage.get(ref, 0) + 1
+            feature_domain = "copper" if layer in copper_layer_names else "non_copper"
+            feature_count = counts["polylines"] + counts["polygons"] + counts["pads"] + counts["cutouts"]
+            if feature_count:
+                board_feature_summary_rows.append({
+                    "layer": layer,
+                    "feature_domain": feature_domain,
+                    "net": net,
+                    **counts,
+                    "contours": contour_count,
+                    "feature_count": feature_count,
+                })
+            for polyline in [x for x in set_elem.iter() if _local(x.tag) == "Polyline"]:
+                points, has_curve = _points_from_geometry(polyline)
+                line_ref = _descriptor_ref(polyline, "LineDescRef")
+                desc = line_desc_by_id.get(line_ref or "")
+                length_summary = _route_length_from_points(points)
+                route_id += 1
+                routes.append({
+                    "id": f"route_{route_id:06d}",
+                    "source": "ipc2581.LayerFeature.Set.Features.Polyline",
+                    "layer": layer,
+                    "net": net,
+                    "feature_domain": feature_domain,
+                    "line_desc_ref": line_ref,
+                    "line_width": desc.get("width") if desc else None,
+                    "line_width_units": desc.get("units") if desc else units,
+                    "points": points,
+                    "bbox": _bbox_from_points(points),
+                    **length_summary,
+                    "has_curve": has_curve,
+                })
+                if not points:
+                    parse_warnings.append({"code": "WARN_POLYLINE_NO_POINTS", "message": f"Polyline on {layer} net {net or '<none>'} has no parsed points."})
+            for polygon in [x for x in set_elem.iter() if _local(x.tag) == "Polygon"]:
+                points, has_curve = _points_from_geometry(polygon)
+                fill_ref = _descriptor_ref(polygon, "FillDescRef")
+                desc = fill_desc_by_id.get(fill_ref or "")
+                polygon_id += 1
+                polygons.append({
+                    "id": f"poly_{polygon_id:06d}",
+                    "source": "ipc2581.LayerFeature.Set.Features.Contour.Polygon",
+                    "layer": layer,
+                    "net": net,
+                    "feature_domain": feature_domain,
+                    "fill_desc_ref": fill_ref,
+                    "fill_type": desc.get("fill_type") if desc else None,
+                    "points": points,
+                    "bbox": _bbox_from_points(points),
+                    "point_count": len(points),
+                    "has_curve": has_curve,
+                })
+                if not points:
+                    parse_warnings.append({"code": "WARN_POLYGON_NO_POINTS", "message": f"Polygon on {layer} net {net or '<none>'} has no parsed points."})
+            for pad in [x for x in set_elem.iter() if _local(x.tag) == "Pad"]:
+                loc = _first_child(pad, {"Location"})
+                x = _to_float(pad.attrib.get("x") or (loc.attrib.get("x") if loc is not None else None))
+                y = _to_float(pad.attrib.get("y") or (loc.attrib.get("y") if loc is not None else None))
+                xform = _first_child(pad, {"Xform", "XForm", "Transform"})
+                pad_id += 1
+                bbox = {"min_x": x, "min_y": y, "max_x": x, "max_y": y} if x is not None and y is not None else None
+                pads.append({
+                    "id": f"pad_{pad_id:06d}",
+                    "source": "ipc2581.LayerFeature.Set.Features.Pad",
+                    "layer": layer,
+                    "net": net,
+                    "feature_domain": feature_domain,
+                    "x": x,
+                    "y": y,
+                    "standard_primitive_ref": pad.attrib.get("standardPrimitiveRef") or pad.attrib.get("stdPrimRef") or pad.attrib.get("primitiveRef"),
+                    "user_primitive_ref": pad.attrib.get("userPrimitiveRef"),
+                    "xform": _attrs(xform),
+                    "bbox": bbox,
+                })
+            for cutout in [x for x in set_elem.iter() if _local(x.tag) == "Cutout"]:
+                points, has_curve = _points_from_geometry(cutout)
+                cutout_id += 1
+                cutouts.append({
+                    "id": f"cutout_{cutout_id:06d}",
+                    "source": "ipc2581.LayerFeature.Set.Features.Cutout",
+                    "layer": layer,
+                    "net": net,
+                    "feature_domain": feature_domain,
+                    "points": points,
+                    "bbox": _bbox_from_points(points),
+                    "point_count": len(points),
+                    "has_curve": has_curve,
+                })
+                if not points:
+                    parse_warnings.append({"code": "WARN_CUTOUT_NO_POINTS", "message": f"Cutout on {layer} net {net or '<none>'} has no parsed points."})
+            if not net:
+                continue
+            layer_summary["nets"].add(net)
+            slot = per_net_layer.setdefault(net, {}).setdefault(layer, {"polylines": 0, "polygons": 0, "pads": 0, "cutouts": 0, "line_desc_refs": set(), "fill_desc_refs": set()})
+            for key, value in counts.items():
+                slot[key] += value
+            slot["line_desc_refs"].update(line_refs)
+            slot["fill_desc_refs"].update(fill_refs)
+            if layer in copper_layer_names:
+                copper_features.append({"layer": layer, "net": net, **counts, "line_desc_refs": line_refs, "fill_desc_refs": fill_refs})
+
+    net_layer_presence = [_make_layer_presence_entry(net, per_net_layer[net]) for net in sorted(per_net_layer)]
+    net_feature_totals = [
+        {
+            "net": e["net"],
+            "polylines": e["total_polylines"],
+            "polygons": e["total_polygons"],
+            "pads": e["total_pads"],
+            "cutouts": e["total_cutouts"],
+            "feature_count": e["total_polylines"] + e["total_polygons"] + e["total_pads"] + e["total_cutouts"],
+            "layers": sorted(e["layers"].keys()),
+        }
+        for e in net_layer_presence
+    ]
+    copper_feature_summary_rows = [
+        {
+            **f,
+            "feature_domain": "copper",
+            "contours": 0,
+            "feature_count": f["polylines"] + f["polygons"] + f["pads"] + f["cutouts"],
+        }
+        for f in copper_features
+    ]
+
+    geom_by_net: dict[str, dict[str, Any]] = {}
+    for route in routes:
+        if route.get("feature_domain") != "copper" or not route.get("net"):
+            continue
+        slot = geom_by_net.setdefault(route["net"], {"routes": 0, "polygons": 0, "pads": 0, "cutouts": 0, "layers": set(), "line_desc_refs": set(), "widths": [], "bbox": None})
+        slot["routes"] += 1
+        slot["layers"].add(route["layer"])
+        if route.get("line_desc_ref"):
+            slot["line_desc_refs"].add(route["line_desc_ref"])
+        if route.get("line_width") is not None:
+            slot["widths"].append(route["line_width"])
+        slot["bbox"] = _merge_bbox(slot["bbox"], route.get("bbox"))
+    for poly in polygons:
+        if poly.get("feature_domain") != "copper" or not poly.get("net"):
+            continue
+        slot = geom_by_net.setdefault(poly["net"], {"routes": 0, "polygons": 0, "pads": 0, "cutouts": 0, "layers": set(), "line_desc_refs": set(), "widths": [], "bbox": None})
+        slot["polygons"] += 1
+        slot["layers"].add(poly["layer"])
+        slot["bbox"] = _merge_bbox(slot["bbox"], poly.get("bbox"))
+    for pad in pads:
+        if pad.get("feature_domain") != "copper" or not pad.get("net"):
+            continue
+        slot = geom_by_net.setdefault(pad["net"], {"routes": 0, "polygons": 0, "pads": 0, "cutouts": 0, "layers": set(), "line_desc_refs": set(), "widths": [], "bbox": None})
+        slot["pads"] += 1
+        slot["layers"].add(pad["layer"])
+        slot["bbox"] = _merge_bbox(slot["bbox"], pad.get("bbox"))
+    for cutout in cutouts:
+        if cutout.get("feature_domain") != "copper" or not cutout.get("net"):
+            continue
+        slot = geom_by_net.setdefault(cutout["net"], {"routes": 0, "polygons": 0, "pads": 0, "cutouts": 0, "layers": set(), "line_desc_refs": set(), "widths": [], "bbox": None})
+        slot["cutouts"] += 1
+        slot["layers"].add(cutout["layer"])
+        slot["bbox"] = _merge_bbox(slot["bbox"], cutout.get("bbox"))
+
+    net_routing_summary = []
+    for net in sorted(geom_by_net):
+        item = geom_by_net[net]
+        widths = item["widths"]
+        net_routing_summary.append({
+            "net": net,
+            "route_count": item["routes"],
+            "polygon_count": item["polygons"],
+            "pad_count": item["pads"],
+            "cutout_count": item["cutouts"],
+            "layers": sorted(item["layers"]),
+            "line_desc_refs": sorted(item["line_desc_refs"]),
+            "min_trace_width": min(widths) if widths else None,
+            "max_trace_width": max(widths) if widths else None,
+            "bbox": item["bbox"],
+        })
+
+    trace_width_usage_map: dict[tuple[str | None, float | None, str | None], dict[str, Any]] = {}
+    for route in routes:
+        if route.get("feature_domain") != "copper":
+            continue
+        key = (route.get("line_desc_ref"), route.get("line_width"), route.get("line_width_units"))
+        item = trace_width_usage_map.setdefault(key, {"line_desc_ref": key[0], "line_width": key[1], "units": key[2], "route_count": 0, "nets": set()})
+        item["route_count"] += 1
+        if route.get("net"):
+            item["nets"].add(route["net"])
+    trace_width_usage = [
+        {**item, "nets": sorted(item["nets"])}
+        for item in sorted(trace_width_usage_map.values(), key=lambda x: (str(x["line_desc_ref"]), x["line_width"] is None, x["line_width"] or 0.0))
+    ]
+
+    plane_candidates = []
+    routing_candidates = []
+    pad_only_nets = []
+    unused_or_unconnected = []
+    known_logical_nets = {n.get("name") for n in nets if n.get("name")}
+    for entry in net_layer_presence:
+        net = entry["net"]
+        copper_layers_for_net = {l: v for l, v in entry["layers"].items() if l in copper_layer_names}
+        poly_cutout = sum(v["polygons"] + v["cutouts"] for v in copper_layers_for_net.values())
+        feature_count = sum(v["polylines"] + v["polygons"] + v["pads"] + v["cutouts"] for v in copper_layers_for_net.values())
+        internal_layers = [l for l in copper_layers_for_net if _layer_role(layer_by_name.get(l, {"name": l})) == "internal"]
+        plane_layers = [l for l in copper_layers_for_net if _upper((layer_by_name.get(l, {}) or {}).get("function") or (layer_by_name.get(l, {}) or {}).get("type")) == "PLANE"]
+        name_reason = _net_name_evidence(net)
+        max_poly_cutout_layer = max(copper_layers_for_net, key=lambda l: copper_layers_for_net[l]["polygons"] + copper_layers_for_net[l]["cutouts"], default=None)
+        max_poly_cutout = (copper_layers_for_net[max_poly_cutout_layer]["polygons"] + copper_layers_for_net[max_poly_cutout_layer]["cutouts"]) if max_poly_cutout_layer else 0
+        internal_poly_cutout_layers = [l for l in internal_layers if copper_layers_for_net[l]["polygons"] or copper_layers_for_net[l]["cutouts"]]
+        internal_cutout_evidence = [l for l in internal_layers if copper_layers_for_net[l]["cutouts"] >= 5]
+        internal_polygon_evidence = [l for l in internal_layers if copper_layers_for_net[l]["polygons"] >= 3]
+        plane_layer_geometry = [l for l in plane_layers if copper_layers_for_net[l]["polygons"] or copper_layers_for_net[l]["cutouts"]]
+        net_bbox_area = _bbox_area((geom_by_net.get(net) or {}).get("bbox"))
+        has_strong_plane_evidence = bool(
+            (name_reason and (internal_poly_cutout_layers or max_poly_cutout >= 5))
+            or internal_cutout_evidence
+            or internal_polygon_evidence
+            or plane_layer_geometry
+            or (name_reason and net_bbox_area >= 0.25 and poly_cutout > 0)
+        )
+        if has_strong_plane_evidence:
+            evidence = []
+            if name_reason:
+                evidence.append(f"power/ground-style name ({name_reason})")
+            for l in sorted(internal_cutout_evidence):
+                evidence.append(f"{copper_layers_for_net[l]['cutouts']} cutouts on {l}")
+            for l in sorted(internal_polygon_evidence):
+                evidence.append(f"{copper_layers_for_net[l]['polygons']} polygons on {l}")
+            for l in sorted(set(plane_layer_geometry) - set(internal_cutout_evidence) - set(internal_polygon_evidence)):
+                evidence.append(f"polygon/cutout evidence on internal plane layer {l}")
+            if name_reason and internal_poly_cutout_layers:
+                evidence.append("power/ground-style name plus internal plane-layer copper geometry")
+            if name_reason and net_bbox_area >= 0.25 and poly_cutout > 0:
+                evidence.append(f"large copper bbox area ({net_bbox_area:.4g}) with polygon/cutout evidence")
+            plane_candidates.append({"net": net, "candidate_reason": "; ".join(f"{net} has {item}" for item in evidence), "layers": sorted(copper_layers_for_net)})
+        route_layers = [l for l, v in copper_layers_for_net.items() if v["polylines"] > 0]
+        if route_layers:
+            routing_candidates.append({"net": net, "layers": sorted(route_layers), "total_polylines": sum(copper_layers_for_net[l]["polylines"] for l in route_layers)})
+        copper_pads = sum(v["pads"] for v in copper_layers_for_net.values())
+        copper_polylines = sum(v["polylines"] for v in copper_layers_for_net.values())
+        copper_polygons = sum(v["polygons"] for v in copper_layers_for_net.values())
+        if copper_layers_for_net and copper_pads > 0 and copper_polylines == 0 and copper_polygons == 0:
+            pad_only_nets.append({"net": net, "pads": copper_pads, "layers": sorted(copper_layers_for_net)})
+        if net not in known_logical_nets or _upper(net) in {"NC", "N/C", "NO_CONNECT", "UNCONNECTED"}:
+            unused_or_unconnected.append({"net": net, "reason": "feature net is not present in logical netlist or is named as unconnected", "layers": sorted(entry["layers"].keys())})
+
+    all_layer_entries = sorted(layer_by_name.values(), key=lambda l: l.get("name") or "")
+    copper_layer_entries = [{"name": l.get("name"), "function": l.get("function") or l.get("type"), "side": l.get("side")} for l in all_layer_entries if l.get("name") in copper_layer_names]
+    non_copper_entries = [{"name": l.get("name"), "function": l.get("function") or l.get("type"), "side": l.get("side")} for l in all_layer_entries if l.get("name") not in copper_layer_names]
+    detailed_limit = 10000
+    detailed_truncated = len(copper_features) > detailed_limit
+    shown_copper_features = copper_features[:detailed_limit]
+    review_summary = {
+        "copper_layers": copper_layer_entries,
+        "non_copper_layers": non_copper_entries,
+        "net_layer_presence": net_layer_presence,
+        "net_feature_totals": net_feature_totals,
+        "plane_candidates": plane_candidates,
+        "routing_candidates": routing_candidates,
+        "pad_only_nets": pad_only_nets,
+        "unused_or_unconnected_feature_nets": unused_or_unconnected,
+        "line_width_ref_usage": [{"line_desc_ref": k, "set_count": line_ref_usage[k]} for k in sorted(line_ref_usage)],
+        "fill_ref_usage": [{"fill_desc_ref": k, "set_count": fill_ref_usage[k]} for k in sorted(fill_ref_usage)],
+        "candidate_differential_or_paired_nets": list(_candidate_pairs({n.get("name") for n in nets if n.get("name")} | set(per_net_layer), set(per_net_layer))),
+        "routing_geometry_available": bool(routes or polygons or pads or cutouts),
+        "routing_geometry_counts": {
+            "routes": len(routes),
+            "polygons": len(polygons),
+            "pads": len(pads),
+            "cutouts": len(cutouts),
+        },
+        "trace_width_usage": trace_width_usage,
+        "net_routing_summary": net_routing_summary,
+        "geometry_review_limitations": GEOMETRY_REVIEW_LIMITATIONS,
+    }
+    routing_topology_summary, trace_width_by_net, trace_width_usage_by_layer, route_length_by_net, route_length_by_layer = _build_routing_topology_summary(
+        units=units,
+        nets=nets,
+        layers=layers,
+        per_net_layer=per_net_layer,
+        geom_by_net=geom_by_net,
+        review_summary=review_summary,
+        routes=routes,
+        legacy_route_segment_count=0,
+    )
+    board_feature_summary = {
+        "layerfeature_count": layerfeature_count,
+        "set_count": set_count,
+        "polyline_count": object_counts["polylines"],
+        "polygon_count": object_counts["polygons"],
+        "pad_count": object_counts["pads"],
+        "cutout_count": object_counts["cutouts"],
+        "detailed_geometry_truncated": detailed_truncated,
+    }
+    layer_feature_summary = []
+    for layer in sorted(layer_totals):
+        item = layer_totals[layer].copy()
+        item["nets"] = sorted(item["nets"])
+        item["net_count"] = len(item["nets"])
+        layer_feature_summary.append(item)
+    normalized_total = len(routes) + len(polygons) + len(pads) + len(cutouts)
+    source_total = object_counts["polylines"] + object_counts["polygons"] + object_counts["pads"] + object_counts["cutouts"]
+    dropped_or_unparsed = max(0, source_total - normalized_total)
+    routing_geometry = {
+        "units": units,
+        "detailed_geometry_truncated": detailed_truncated,
+        "feature_count": normalized_total,
+        "polyline_count": len(routes),
+        "polygon_count": len(polygons),
+        "pad_count": len(pads),
+        "cutout_count": len(cutouts),
+        "routes": routes,
+        "polygons": polygons,
+        "pads": pads,
+        "cutouts": cutouts,
+    }
+    routing_geometry_extraction = {
+        "enabled": True,
+        "units": units,
+        "layerfeature_count": layerfeature_count,
+        "set_count": set_count,
+        "source_polyline_object_count": object_counts["polylines"],
+        "source_polygon_object_count": object_counts["polygons"],
+        "source_pad_object_count": object_counts["pads"],
+        "source_cutout_object_count": object_counts["cutouts"],
+        "normalized_route_count": len(routes),
+        "normalized_polygon_count": len(polygons),
+        "normalized_pad_count": len(pads),
+        "normalized_cutout_count": len(cutouts),
+        "non_copper_polyline_count": non_copper_counts["polylines"],
+        "non_copper_polygon_count": non_copper_counts["polygons"],
+        "detailed_geometry_truncated": detailed_truncated,
+        "detail_limit": None,
+        "dropped_or_unparsed_feature_count": dropped_or_unparsed,
+        "parse_warnings": parse_warnings,
+    }
+    return {
+        "copper_features": shown_copper_features,
+        "copper_feature_summary": {
+            "layer_count": len(copper_layer_entries),
+            "feature_set_count": len(copper_features),
+            "polyline_count": sum(f["polylines"] for f in copper_features),
+            "polygon_count": sum(f["polygons"] for f in copper_features),
+            "pad_count": sum(f["pads"] for f in copper_features),
+            "cutout_count": sum(f["cutouts"] for f in copper_features),
+            "detailed_geometry_truncated": detailed_truncated,
+        },
+        "copper_feature_summary_rows": copper_feature_summary_rows,
+        "board_feature_summary_rows": board_feature_summary_rows,
+        "routing_geometry": routing_geometry,
+        "routing_geometry_extraction": routing_geometry_extraction,
+        "line_descriptors": line_descriptors,
+        "fill_descriptors": fill_descriptors,
+        "routing_topology_summary": routing_topology_summary,
+        "trace_width_by_net": trace_width_by_net,
+        "trace_width_usage_by_layer": trace_width_usage_by_layer,
+        "route_length_by_net": route_length_by_net,
+        "route_length_by_layer": route_length_by_layer,
+        "board_feature_summary": board_feature_summary,
+        "board_geometry_analysis": {"layers": layer_feature_summary},
+        "review_geometry_summary": review_summary,
+        "candidate_differential_or_paired_nets": review_summary["candidate_differential_or_paired_nets"],
+        "geometry_review_limitations": GEOMETRY_REVIEW_LIMITATIONS,
+        "geometry_counts": {
+            "layerfeature_count": layerfeature_count,
+            "set_count": set_count,
+            **object_counts,
+            "detailed_geometry_truncated": detailed_truncated,
+        },
+    }
+
+
 def parse_ipc2581(project_root: Path, files: list[ClassifiedFile]) -> dict[str, Any]:
     warnings: list[dict[str, Any]] = []
     cands = sorted([f for f in files if f.category == "ipc2581_candidate"], key=lambda f: f.relative_path)
@@ -450,7 +1438,7 @@ def parse_ipc2581(project_root: Path, files: list[ClassifiedFile]) -> dict[str, 
     rev=root.attrib.get('revision') or root.attrib.get('Revision')
     units = root.attrib.get("units") or root.attrib.get("unit")
     if units is None:
-        for tag_name in ("CadHeader", "Step", "CadData", "Content"):
+        for tag_name in ("CadHeader", "Step", "CadData", "Content", "DictionaryLineDesc", "DictionaryFillDesc", "DictionaryStandard"):
             node = next((e for e in root.iter() if _local(e.tag) == tag_name and (e.attrib.get("units") or e.attrib.get("unit"))), None)
             if node is not None:
                 units = node.attrib.get("units") or node.attrib.get("unit")
@@ -570,17 +1558,54 @@ def parse_ipc2581(project_root: Path, files: list[ClassifiedFile]) -> dict[str, 
         warnings.append({"code":"WARN_IPC_STACKUP_UNAVAILABLE","message":"Material/thickness stackup details unavailable; using known ordered layer metadata."})
     if not layers: warnings.append({"code":"WARN_IPC_LAYERS_UNAVAILABLE","message":"No layers extracted from IPC file."})
 
+    geometry = extract_layerfeature_geometry(root, layers, nets, units)
+    geometry_counts = geometry.get("geometry_counts", {})
     plated_hole_count = sum(1 for d in drills if (d.get("platingStatus") or "").upper() == "PLATED")
     nonplated_hole_count = sum(1 for d in drills if (d.get("platingStatus") or "").upper() == "NONPLATED")
-    counts={"board_component_count":len(components),"placement_count":len(components),"placements_with_xy_count":sum(1 for c in components if c.get("x") is not None and c.get("y") is not None),"board_net_count":len(nets),"logical_net_count":len(nets),"physical_net_count":len(physical_nets),"phy_net_point_count":phy_point_count,"layer_count":len(layers),"stackup_layer_count":len(stack),"hole_count":len(drills),"via_count":len(vias),"plated_hole_count":plated_hole_count,"nonplated_hole_count":nonplated_hole_count,"drills_with_plating_status_count":sum(1 for d in drills if d.get("platingStatus")),"drill_count":len(drills),"route_segment_count":len(routes),"outline_point_count":len(outline)}
+    counts={"board_component_count":len(components),"placement_count":len(components),"placements_with_xy_count":sum(1 for c in components if c.get("x") is not None and c.get("y") is not None),"board_net_count":len(nets),"logical_net_count":len(nets),"physical_net_count":len(physical_nets),"phy_net_point_count":phy_point_count,"layer_count":len(layers),"stackup_layer_count":len(stack),"hole_count":len(drills),"via_count":len(vias),"plated_hole_count":plated_hole_count,"nonplated_hole_count":nonplated_hole_count,"drills_with_plating_status_count":sum(1 for d in drills if d.get("platingStatus")),"drill_count":len(drills),"route_segment_count":len(routes),"outline_point_count":len(outline),"layerfeature_count":geometry_counts.get("layerfeature_count",0),"set_count":geometry_counts.get("set_count",0),"polyline_object_count":geometry_counts.get("polylines",0),"polygon_object_count":geometry_counts.get("polygons",0),"pad_object_count":geometry_counts.get("pads",0),"cutout_object_count":geometry_counts.get("cutouts",0),"detailed_geometry_truncated":geometry_counts.get("detailed_geometry_truncated",False)}
     def _norm_layer(v: str | None) -> str:
         return (v or "").upper()
     analysis={"layer_count":len(layers),"layers_used":[l['name'] for l in layers],"ground_plane_layers":[l['name'] for l in layers if _norm_layer(l.get('function') or l.get('type')) in {"PLANE", "GROUND"} or ('GND' in (l['name'] or '').upper())],"signal_layers":[l['name'] for l in layers if _norm_layer(l.get('function') or l.get('type')) in {"CONDUCTOR", "SIGNAL", "INTERNAL"}]}
-    return {"source_file":src.relative_path,"parser_version":IPC_PARSER_VERSION,"ipc_root":ipc_root,"ipc_revision":rev,"namespace":ns,"units":units,"components":components,"nets":nets,"physical_nets":physical_nets,"layers":layers,"stackup_layers":stack,"outline":outline,"vias":vias,"drills":drills,"route_segments":routes,"analysis":analysis,"warnings":warnings,"extraction_counts":counts}
+    return {"source_file":src.relative_path,"parser_version":IPC_PARSER_VERSION,"ipc_root":ipc_root,"ipc_revision":rev,"namespace":ns,"units":units,"components":components,"nets":nets,"physical_nets":physical_nets,"layers":layers,"stackup_layers":stack,"outline":outline,"vias":vias,"drills":drills,"route_segments":routes,"analysis":analysis,"warnings":warnings,"extraction_counts":counts,**geometry}
 
 
 def build_board_export(project_name:str, project_root:Path, ipc:dict[str,Any])->dict[str,Any]:
-    return {"project_name":project_name,"source":{"project_root":str(project_root),"layout_file":ipc.get('source_file'),"format":"ipc2581","ipc_root":ipc.get('ipc_root'),"ipc_revision":ipc.get('ipc_revision'),"namespace":ipc.get('namespace'),"units":ipc.get('units')},"units":ipc.get("units"),"parser_version":ipc.get('parser_version'),"components":ipc.get('components',[]),"placements":ipc.get('components',[]),"nets":ipc.get('nets',[]),"physical_nets":ipc.get('physical_nets',[]),"layers":ipc.get('layers',[]),"board_outline":ipc.get('outline',[]),"vias":ipc.get('vias',[]),"drills":ipc.get('drills',[]),"routes":ipc.get('route_segments',[]),"analysis":ipc.get('analysis',{}),"warnings":ipc.get('warnings',[]),"extraction_counts":ipc.get('extraction_counts',{})}
+    return {
+        "project_name": project_name,
+        "source": {"project_root": str(project_root), "layout_file": ipc.get("source_file"), "format": "ipc2581", "ipc_root": ipc.get("ipc_root"), "ipc_revision": ipc.get("ipc_revision"), "namespace": ipc.get("namespace"), "units": ipc.get("units")},
+        "units": ipc.get("units"),
+        "parser_version": ipc.get("parser_version"),
+        "components": ipc.get("components", []),
+        "placements": ipc.get("components", []),
+        "nets": ipc.get("nets", []),
+        "physical_nets": ipc.get("physical_nets", []),
+        "layers": ipc.get("layers", []),
+        "board_outline": ipc.get("outline", []),
+        "vias": ipc.get("vias", []),
+        "drills": ipc.get("drills", []),
+        "routes": ipc.get("route_segments", []),
+        "analysis": ipc.get("analysis", {}),
+        "copper_feature_summary": ipc.get("copper_feature_summary", {}),
+        "copper_features": ipc.get("copper_features", []),
+        "copper_feature_summary_rows": ipc.get("copper_feature_summary_rows", []),
+        "board_feature_summary": ipc.get("board_feature_summary", {}),
+        "board_feature_summary_rows": ipc.get("board_feature_summary_rows", []),
+        "board_geometry_analysis": ipc.get("board_geometry_analysis", {}),
+        "routing_geometry": ipc.get("routing_geometry", {}),
+        "routing_geometry_extraction": ipc.get("routing_geometry_extraction", {}),
+        "routing_topology_summary": ipc.get("routing_topology_summary", {}),
+        "trace_width_by_net": ipc.get("trace_width_by_net", []),
+        "trace_width_usage_by_layer": ipc.get("trace_width_usage_by_layer", []),
+        "route_length_by_net": ipc.get("route_length_by_net", []),
+        "route_length_by_layer": ipc.get("route_length_by_layer", []),
+        "line_descriptors": ipc.get("line_descriptors", []),
+        "fill_descriptors": ipc.get("fill_descriptors", []),
+        "review_geometry_summary": ipc.get("review_geometry_summary", {}),
+        "candidate_differential_or_paired_nets": ipc.get("candidate_differential_or_paired_nets", []),
+        "geometry_review_limitations": ipc.get("geometry_review_limitations", GEOMETRY_REVIEW_LIMITATIONS),
+        "warnings": ipc.get("warnings", []),
+        "extraction_counts": ipc.get("extraction_counts", {}),
+    }
 
 
 def build_stack_export(project_name:str, project_root:Path, ipc:dict[str,Any])->dict[str,Any]:
@@ -622,7 +1647,8 @@ def render_pdf_images(args: argparse.Namespace, project_root: Path, output_root:
         if proc.returncode != 0:
             errors.append({"code":"ERR_PDF_RENDER_FAILED","message":f"Failed rendering {pdf_rel}"})
             return []
-        return sorted(output_root.glob(f"{prefix}-*.png"))
+        fresh_name = re.compile(rf"^{re.escape(prefix)}-\d+\.png$")
+        return sorted(p for p in output_root.glob(f"{prefix}-*.png") if fresh_name.match(p.name))
 
     if args.dry_run or args.report_only:
         status["skipped_pdfs"] = [f.relative_path for f in schem_pdfs + layout_pdfs]
@@ -726,6 +1752,18 @@ def build_report(args: argparse.Namespace, project_root: Path, output_root: Path
     counts: dict[str, int] = {}
     for f in files:
         counts[f.category] = counts.get(f.category, 0) + 1
+    routing_topology = ipc.get("routing_topology_summary", {})
+    trace_width_by_net = routing_topology.get("trace_width_by_net", ipc.get("trace_width_by_net", []))
+    trace_width_usage_by_layer = routing_topology.get("trace_width_usage_by_layer", ipc.get("trace_width_usage_by_layer", []))
+    route_length_by_net = routing_topology.get("route_length_by_net", ipc.get("route_length_by_net", []))
+    route_length_by_layer = routing_topology.get("route_length_by_layer", ipc.get("route_length_by_layer", []))
+    normalized_routes = ipc.get("routing_geometry", {}).get("routes", [])
+    routes_with_length = [r for r in normalized_routes if isinstance(r.get("length"), (int, float))]
+    routes_with_estimated_length = [r for r in routes_with_length if r.get("length_is_estimated")]
+    paired_length_comparisons = [
+        p for p in routing_topology.get("paired_net_geometry_comparison", [])
+        if isinstance((p.get("comparison") or {}).get("route_length_delta"), (int, float))
+    ]
 
     return {
         "metadata": {
@@ -754,7 +1792,7 @@ def build_report(args: argparse.Namespace, project_root: Path, output_root: Path
             "json_validation": {"status": "skipped" if args.dry_run or args.report_only else "pending"},
         },
         "planned_outputs": planned_outputs(project_name, output_root),
-        "ipc2581": {"source_file": ipc.get("source_file"), "root": ipc.get("ipc_root"), "revision": ipc.get("ipc_revision"), "namespace": ipc.get("namespace"), "component_count": ipc.get("extraction_counts", {}).get("board_component_count", 0), "placement_count": ipc.get("extraction_counts", {}).get("placement_count", 0), "placements_with_xy_count": ipc.get("extraction_counts", {}).get("placements_with_xy_count", 0), "net_count": ipc.get("extraction_counts", {}).get("board_net_count", 0), "logical_net_count": ipc.get("extraction_counts", {}).get("logical_net_count", 0), "physical_net_count": ipc.get("extraction_counts", {}).get("physical_net_count", 0), "phy_net_point_count": ipc.get("extraction_counts", {}).get("phy_net_point_count", 0), "layer_count": ipc.get("extraction_counts", {}).get("layer_count", 0), "stackup_layer_count": ipc.get("extraction_counts", {}).get("stackup_layer_count", 0), "via_count": ipc.get("extraction_counts", {}).get("via_count", 0), "drill_count": ipc.get("extraction_counts", {}).get("drill_count", 0), "route_segment_count": ipc.get("extraction_counts", {}).get("route_segment_count", 0), "outline_point_count": ipc.get("extraction_counts", {}).get("outline_point_count", 0), "parse_warnings": ipc.get("warnings", []), "board_output_file": str(output_root / f"{project_name}-thomson-export-brd.json"), "stack_output_file": str(output_root / f"{project_name}-thomson-export-stack.json"), "board_json_validation": {"status": "skipped" if args.dry_run or args.report_only else "pending"}, "stack_json_validation": {"status": "skipped" if args.dry_run or args.report_only else "pending"}},
+        "ipc2581": {"source_file": ipc.get("source_file"), "root": ipc.get("ipc_root"), "revision": ipc.get("ipc_revision"), "namespace": ipc.get("namespace"), "component_count": ipc.get("extraction_counts", {}).get("board_component_count", 0), "placement_count": ipc.get("extraction_counts", {}).get("placement_count", 0), "placements_with_xy_count": ipc.get("extraction_counts", {}).get("placements_with_xy_count", 0), "net_count": ipc.get("extraction_counts", {}).get("board_net_count", 0), "logical_net_count": ipc.get("extraction_counts", {}).get("logical_net_count", 0), "physical_net_count": ipc.get("extraction_counts", {}).get("physical_net_count", 0), "phy_net_point_count": ipc.get("extraction_counts", {}).get("phy_net_point_count", 0), "layer_count": ipc.get("extraction_counts", {}).get("layer_count", 0), "stackup_layer_count": ipc.get("extraction_counts", {}).get("stackup_layer_count", 0), "via_count": ipc.get("extraction_counts", {}).get("via_count", 0), "drill_count": ipc.get("extraction_counts", {}).get("drill_count", 0), "route_segment_count": ipc.get("extraction_counts", {}).get("route_segment_count", 0), "outline_point_count": ipc.get("extraction_counts", {}).get("outline_point_count", 0), "copper_feature_extraction_enabled": True, "layerfeature_count": ipc.get("extraction_counts", {}).get("layerfeature_count", 0), "set_count": ipc.get("extraction_counts", {}).get("set_count", 0), "polyline_object_count": ipc.get("extraction_counts", {}).get("polyline_object_count", 0), "polygon_object_count": ipc.get("extraction_counts", {}).get("polygon_object_count", 0), "pad_object_count": ipc.get("extraction_counts", {}).get("pad_object_count", 0), "cutout_object_count": ipc.get("extraction_counts", {}).get("cutout_object_count", 0), "detailed_geometry_truncated": ipc.get("extraction_counts", {}).get("detailed_geometry_truncated", False), "review_geometry_summary_counts": {"copper_layers": len(ipc.get("review_geometry_summary", {}).get("copper_layers", [])), "non_copper_layers": len(ipc.get("review_geometry_summary", {}).get("non_copper_layers", [])), "net_layer_presence": len(ipc.get("review_geometry_summary", {}).get("net_layer_presence", [])), "plane_candidates": len(ipc.get("review_geometry_summary", {}).get("plane_candidates", [])), "routing_candidates": len(ipc.get("review_geometry_summary", {}).get("routing_candidates", [])), "pad_only_nets": len(ipc.get("review_geometry_summary", {}).get("pad_only_nets", [])), "candidate_differential_or_paired_nets": len(ipc.get("review_geometry_summary", {}).get("candidate_differential_or_paired_nets", []))}, "routing_topology_summary_enabled": bool(routing_topology), "routed_net_count": routing_topology.get("routed_net_count", 0), "pad_only_net_count": routing_topology.get("pad_only_net_count", 0), "paired_net_geometry_comparison_count": len(routing_topology.get("paired_net_geometry_comparison", [])), "layer_transition_candidate_count": len(routing_topology.get("layer_transition_candidates", [])), "trace_width_by_net_count": len(trace_width_by_net), "trace_width_usage_by_layer_count": len(trace_width_usage_by_layer), "routing_evidence_warning_count": len(routing_topology.get("routing_evidence_warnings", [])), "parse_warnings": ipc.get("warnings", []), "board_output_file": str(output_root / f"{project_name}-thomson-export-brd.json"), "stack_output_file": str(output_root / f"{project_name}-thomson-export-stack.json"), "board_json_validation": {"status": "skipped" if args.dry_run or args.report_only else "pending"}, "stack_json_validation": {"status": "skipped" if args.dry_run or args.report_only else "pending"}},
         "images": images.get("report", {}),
         "image_outputs": images.get("image_outputs", []),
         "validation": {},
