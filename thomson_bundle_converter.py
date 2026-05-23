@@ -448,6 +448,28 @@ def _is_copper_layer(layer: dict[str, Any]) -> bool:
     return function in {"CONDUCTOR", "PLANE", "SIGNAL", "INTERNAL"} or name in {"TOP", "BOTTOM"} or bool(re.fullmatch(r"LAYER\d+", name))
 
 
+def _layer_feature_domain(layer: dict[str, Any]) -> str:
+    function = _upper(layer.get("function") or layer.get("type"))
+    name = _upper(layer.get("name"))
+    if _is_copper_layer(layer):
+        return "copper"
+    if function == "DRILL" or "DRILL" in name:
+        return "drill"
+    if function == "SOLDERMASK" or "SOLDERMASK" in name or name.startswith("SM"):
+        return "soldermask"
+    if function == "PASTEMASK" or "PASTE" in name:
+        return "pastemask"
+    if function == "SILKSCREEN" or "SILK" in name or name.startswith("SS"):
+        return "silkscreen"
+    if function == "ASSEMBLY" or "ASSY" in name:
+        return "assembly"
+    if function == "BOARD_OUTLINE" or "OUTLINE" in name:
+        return "outline"
+    if function in {"DOCUMENT", "FABRICATION"} or "FAB" in name or "LEGEND" in name:
+        return "fabrication"
+    return "unknown"
+
+
 def _layer_role(layer: dict[str, Any]) -> str:
     side = _upper(layer.get("side"))
     name = _upper(layer.get("name"))
@@ -526,7 +548,19 @@ def _points_from_geometry(e: ET.Element) -> tuple[list[dict[str, Any]], bool]:
     return points, has_curve
 
 
-def _route_length_from_points(points: list[dict[str, Any]]) -> dict[str, Any]:
+def _unit_to_inch_factor(units: str | None) -> float:
+    unit = _upper(units)
+    if unit in {"IN", "INCH", "INCHES"}:
+        return 1.0
+    if unit in {"MM", "MILLIMETER", "MILLIMETERS"}:
+        return 1.0 / 25.4
+    if unit in {"MIL", "MILS"}:
+        return 0.001
+    return 1.0
+
+
+def _route_length_from_points(points: list[dict[str, Any]], units: str | None) -> dict[str, Any]:
+    to_inch = _unit_to_inch_factor(units)
     total = 0.0
     segment_count = 0
     curve_count = 0
@@ -543,14 +577,14 @@ def _route_length_from_points(points: list[dict[str, Any]]) -> dict[str, Any]:
         if not all(isinstance(v, (int, float)) for v in (x1, y1, x2, y2)):
             prev = point
             continue
-        chord = math.hypot(x2 - x1, y2 - y1)
+        chord = math.hypot(x2 - x1, y2 - y1) * to_inch
         if point.get("kind") == "curve":
             curve_count += 1
             cx = point.get("center_x")
             cy = point.get("center_y")
             if isinstance(cx, (int, float)) and isinstance(cy, (int, float)):
-                radius_a = math.hypot(x1 - cx, y1 - cy)
-                radius_b = math.hypot(x2 - cx, y2 - cy)
+                radius_a = math.hypot(x1 - cx, y1 - cy) * to_inch
+                radius_b = math.hypot(x2 - cx, y2 - cy) * to_inch
                 radius = (radius_a + radius_b) / 2.0
                 if radius > 0:
                     start = math.atan2(y1 - cy, x1 - cx)
@@ -576,6 +610,171 @@ def _route_length_from_points(points: list[dict[str, Any]]) -> dict[str, Any]:
         "length_is_estimated": estimated,
         "segment_count": segment_count,
         "curve_count": curve_count,
+    }
+
+
+def _hole_type(plating_status: str | None) -> str:
+    status = _upper(plating_status)
+    if status == "VIA":
+        return "via"
+    if status == "PLATED":
+        return "plated_hole"
+    if status == "NONPLATED":
+        return "nonplated_hole"
+    return "hole"
+
+
+def _bbox_from_circle(x: float | None, y: float | None, diameter: float | None) -> dict[str, float] | None:
+    if x is None or y is None or diameter is None:
+        return None
+    radius = diameter / 2.0
+    return {"min_x": x - radius, "min_y": y - radius, "max_x": x + radius, "max_y": y + radius}
+
+
+def _extract_layerfeature_holes(root: ET.Element, units: str | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
+    holes: list[dict[str, Any]] = []
+    parse_warnings: list[dict[str, Any]] = []
+    hole_id = 0
+    for lf in root.iter():
+        if _local(lf.tag) != "LayerFeature":
+            continue
+        layer = lf.attrib.get("layerRef") or lf.attrib.get("layer") or lf.attrib.get("name")
+        for set_elem in [c for c in lf if _local(c.tag) == "Set"]:
+            net = set_elem.attrib.get("net") or set_elem.attrib.get("netRef") or set_elem.attrib.get("netName") or None
+            for hole in [x for x in set_elem.iter() if _local(x.tag) == "Hole"]:
+                hole_id += 1
+                x = _to_float(hole.attrib.get("x"))
+                y = _to_float(hole.attrib.get("y"))
+                diameter = _to_float(hole.attrib.get("diameter") or hole.attrib.get("drill"))
+                plating_status = hole.attrib.get("platingStatus") or hole.attrib.get("plating_status") or hole.attrib.get("plated")
+                row = {
+                    "id": f"hole_{hole_id:06d}",
+                    "source": "ipc2581.LayerFeature.Set.Hole",
+                    "name": hole.attrib.get("name"),
+                    "net": net,
+                    "layer": layer,
+                    "x": x,
+                    "y": y,
+                    "diameter": diameter,
+                    "diameter_units": units,
+                    "plating_status": plating_status,
+                    "hole_type": _hole_type(plating_status),
+                    "layer_span": hole.attrib.get("layerSpan") or hole.attrib.get("fromLayer") or hole.attrib.get("toLayer"),
+                    "bbox": _bbox_from_circle(x, y, diameter),
+                    "raw": _attrs(hole),
+                }
+                holes.append(row)
+                if x is None or y is None or diameter is None:
+                    parse_warnings.append({"code": "WARN_HOLE_GEOMETRY_INCOMPLETE", "message": f"Hole {row['id']} has incomplete location or diameter."})
+
+    via_holes = [
+        {
+            "id": h["id"],
+            "net": h.get("net"),
+            "x": h.get("x"),
+            "y": h.get("y"),
+            "diameter": h.get("diameter"),
+            "diameter_units": h.get("diameter_units"),
+            "layer": h.get("layer"),
+            "layer_span": h.get("layer_span"),
+            "plating_status": h.get("plating_status"),
+        }
+        for h in holes if h.get("hole_type") == "via"
+    ]
+    plated_holes = [h for h in holes if _upper(h.get("plating_status")) in {"VIA", "PLATED"}]
+    nonplated_holes = [h for h in holes if _upper(h.get("plating_status")) == "NONPLATED"]
+    summary = {
+        "total_holes": len(holes),
+        "via_holes": len(via_holes),
+        "plated_holes": len(plated_holes),
+        "nonplated_holes": len(nonplated_holes),
+        "holes_with_net": sum(1 for h in holes if h.get("net")),
+        "holes_without_net": sum(1 for h in holes if not h.get("net")),
+        "units": units,
+    }
+    return holes, via_holes, plated_holes, nonplated_holes, summary, parse_warnings
+
+
+def _extract_package_geometry(root: ET.Element) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    packages = [e for e in root.iter() if _local(e.tag) == "Package"]
+    land_patterns: list[dict[str, Any]] = []
+    totals = {
+        "package_count": len(packages),
+        "landpattern_pad_count": 0,
+        "package_outline_polygon_count": 0,
+        "assembly_drawing_polyline_count": 0,
+        "assembly_drawing_polygon_count": 0,
+        "silkscreen_marking_polyline_count": 0,
+        "silkscreen_marking_polygon_count": 0,
+        "user_primitive_polyline_count": 0,
+        "user_primitive_polygon_count": 0,
+    }
+    for pkg in packages:
+        name = pkg.attrib.get("name") or pkg.attrib.get("id")
+        land_pattern_nodes = [c for c in pkg.iter() if _local(c.tag) == "LandPattern"]
+        pad_count = 0
+        bbox = None
+        for lp in land_pattern_nodes:
+            for pad in [x for x in lp.iter() if _local(x.tag) == "Pad"]:
+                pad_count += 1
+                loc = _first_child(pad, {"Location"})
+                x = _to_float(pad.attrib.get("x") or (loc.attrib.get("x") if loc is not None else None))
+                y = _to_float(pad.attrib.get("y") or (loc.attrib.get("y") if loc is not None else None))
+                if x is not None and y is not None:
+                    bbox = _merge_bbox(bbox, {"min_x": x, "min_y": y, "max_x": x, "max_y": y})
+        totals["landpattern_pad_count"] += pad_count
+        outlines = [x for x in pkg.iter() if _local(x.tag) in {"Outline", "PackageOutline"}]
+        outline_polygon_count = sum(1 for o in outlines for x in o.iter() if _local(x.tag) == "Polygon")
+        totals["package_outline_polygon_count"] += outline_polygon_count
+        assembly_polylines = 0
+        assembly_polygons = 0
+        silkscreen_polylines = 0
+        silkscreen_polygons = 0
+        for node in pkg.iter():
+            tag = _upper(_local(node.tag))
+            if "ASSEMBLY" in tag or "ASSEMBLY" in _upper(node.attrib.get("type")):
+                assembly_polylines += sum(1 for x in node.iter() if _local(x.tag) == "Polyline")
+                assembly_polygons += sum(1 for x in node.iter() if _local(x.tag) == "Polygon")
+            if "SILK" in tag or "SILK" in _upper(node.attrib.get("type")):
+                silkscreen_polylines += sum(1 for x in node.iter() if _local(x.tag) == "Polyline")
+                silkscreen_polygons += sum(1 for x in node.iter() if _local(x.tag) == "Polygon")
+        totals["assembly_drawing_polyline_count"] += assembly_polylines
+        totals["assembly_drawing_polygon_count"] += assembly_polygons
+        totals["silkscreen_marking_polyline_count"] += silkscreen_polylines
+        totals["silkscreen_marking_polygon_count"] += silkscreen_polygons
+        if pad_count or outline_polygon_count or assembly_polylines or silkscreen_polylines:
+            land_patterns.append({
+                "package_ref": name,
+                "pad_count": pad_count,
+                "outline_polygon_count": outline_polygon_count,
+                "assembly_polyline_count": assembly_polylines,
+                "assembly_polygon_count": assembly_polygons,
+                "silkscreen_polyline_count": silkscreen_polylines,
+                "silkscreen_polygon_count": silkscreen_polygons,
+                "bbox": bbox,
+            })
+    for entry in root.iter():
+        if _local(entry.tag) != "EntryUser":
+            continue
+        totals["user_primitive_polyline_count"] += sum(1 for x in entry.iter() if _local(x.tag) == "Polyline")
+        totals["user_primitive_polygon_count"] += sum(1 for x in entry.iter() if _local(x.tag) == "Polygon")
+    return totals, sorted(land_patterns, key=lambda r: r.get("package_ref") or "")
+
+
+def _build_stackup_data_quality(layers: list[dict[str, Any]], stack: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "layer_names_available": bool(layers and all(l.get("name") for l in layers)),
+        "layer_order_available": bool(stack),
+        "layer_function_available": any(l.get("function") or l.get("type") for l in layers),
+        "layer_side_available": any(l.get("side") for l in layers),
+        "material_thickness_available": any(s.get("thickness") for s in stack),
+        "dielectric_material_available": any(s.get("material") or s.get("dielectric_constant") for s in stack),
+        "copper_weight_available": any(s.get("copper_thickness") for s in stack),
+        "impedance_rules_available": False,
+        "source": "ipc2581",
+        "warnings": [
+            "Material/thickness stackup details unavailable; using known ordered layer metadata."
+        ] if not any(s.get("thickness") for s in stack) else [],
     }
 
 
@@ -671,6 +870,68 @@ def _parse_fill_descriptors(root: ET.Element, default_units: str | None) -> tupl
     return rows, {r["id"]: r for r in rows}
 
 
+def _parse_pad_primitives(root: ET.Element, default_units: str | None) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    pad_primitives: list[dict[str, Any]] = []
+    user_primitives: list[dict[str, Any]] = []
+    for entry in root.iter():
+        if _local(entry.tag) != "EntryStandard":
+            continue
+        ident = entry.attrib.get("id")
+        if not ident:
+            continue
+        shape_node = next((c for c in entry if _local(c.tag) not in {"Description"}), None)
+        shape_tag = _local(shape_node.tag) if shape_node is not None else None
+        shape = None
+        width = height = diameter = None
+        if shape_tag == "Circle":
+            shape = "circle"
+            diameter = _to_float(shape_node.attrib.get("diameter") if shape_node is not None else None)
+        elif shape_tag == "RectCenter":
+            shape = "rect_center"
+            width = _to_float(shape_node.attrib.get("width") if shape_node is not None else None)
+            height = _to_float(shape_node.attrib.get("height") if shape_node is not None else None)
+        elif shape_tag:
+            shape = re.sub(r"(?<!^)([A-Z])", r"_\1", shape_tag).lower()
+        pad_primitives.append({
+            "id": ident,
+            "shape": shape,
+            "diameter": diameter,
+            "width": width,
+            "height": height,
+            "units": entry.attrib.get("units") or default_units,
+            "raw": {"entry": _attrs(entry), "primitive": {"tag": shape_tag, **(_attrs(shape_node) if shape_node is not None else {})}},
+        })
+    for entry in root.iter():
+        if _local(entry.tag) != "EntryUser":
+            continue
+        ident = entry.attrib.get("id")
+        if not ident:
+            continue
+        children = [{"tag": _local(c.tag), "attrs": _attrs(c)} for c in entry]
+        user_primitives.append({
+            "id": ident,
+            "primitive_type": children[0]["tag"] if children else None,
+            "summary": {"child_count": len(children), "child_tags": sorted({c["tag"] for c in children})},
+            "raw": {"entry": _attrs(entry), "children": children[:10]},
+        })
+    pad_primitives = sorted(pad_primitives, key=lambda r: r["id"])
+    user_primitives = sorted(user_primitives, key=lambda r: r["id"])
+    return pad_primitives, {p["id"]: p for p in pad_primitives}, user_primitives, {p["id"]: p for p in user_primitives}
+
+
+def _pad_bbox_from_primitive(x: float | None, y: float | None, primitive: dict[str, Any] | None) -> dict[str, float] | None:
+    if x is None or y is None or primitive is None:
+        return None
+    diameter = primitive.get("diameter")
+    width = primitive.get("width")
+    height = primitive.get("height")
+    if isinstance(diameter, (int, float)):
+        return _bbox_from_circle(x, y, diameter)
+    if isinstance(width, (int, float)) and isinstance(height, (int, float)):
+        return {"min_x": x - width / 2.0, "min_y": y - height / 2.0, "max_x": x + width / 2.0, "max_y": y + height / 2.0}
+    return None
+
+
 def _make_layer_presence_entry(net: str, layer_map: dict[str, dict[str, Any]]) -> dict[str, Any]:
     ordered_layers = {}
     totals = {"polylines": 0, "polygons": 0, "pads": 0, "cutouts": 0}
@@ -745,6 +1006,7 @@ def _build_routing_topology_summary(
     geom_by_net: dict[str, dict[str, Any]],
     review_summary: dict[str, Any],
     routes: list[dict[str, Any]],
+    holes_by_net: dict[str, dict[str, Any]] | None = None,
     legacy_route_segment_count: int = 0,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     layer_by_name = {l.get("name"): l for l in layers if l.get("name")}
@@ -803,6 +1065,7 @@ def _build_routing_topology_summary(
         for item in sorted(route_length_layer_map.values(), key=lambda r: str(r["layer"]))
     ]
     route_length_by_net_map = {row["net"]: row for row in route_length_by_net}
+    holes_by_net = holes_by_net or {}
 
     topology_nets = []
     presence_by_net = {p.get("net"): p for p in review_summary.get("net_layer_presence", []) if p.get("net")}
@@ -845,6 +1108,10 @@ def _build_routing_topology_summary(
             "is_pad_only": net in pad_only_nets,
             "is_routing_candidate": net in routing_nets or item.get("routes", 0) > 0,
             "geometry_evidence": evidence,
+            "hole_count": (holes_by_net.get(net) or {}).get("hole_count", 0),
+            "via_hole_count": (holes_by_net.get(net) or {}).get("via_hole_count", 0),
+            "plated_hole_count": (holes_by_net.get(net) or {}).get("plated_hole_count", 0),
+            "nonplated_hole_count": (holes_by_net.get(net) or {}).get("nonplated_hole_count", 0),
         }
         topology_nets.append(row)
         if row["route_count"] > 0:
@@ -938,6 +1205,19 @@ def _build_routing_topology_summary(
             "cutout_count": row["cutout_count"],
         })
 
+    via_hole_by_net = [
+        {
+            "net": net,
+            "via_hole_count": item.get("via_hole_count", 0),
+            "plated_hole_count": item.get("plated_hole_count", 0),
+            "nonplated_hole_count": item.get("nonplated_hole_count", 0),
+            "diameters": sorted(item.get("diameters", [])),
+            "layers": sorted(item.get("layers", [])),
+        }
+        for net, item in sorted(holes_by_net.items())
+        if item.get("hole_count", 0) > 0
+    ]
+
     trace_width_by_layer_map: dict[tuple[str | None, str | None, float | None, str | None], dict[str, Any]] = {}
     for route in routes:
         if route.get("feature_domain") != "copper":
@@ -958,8 +1238,12 @@ def _build_routing_topology_summary(
     if paired_comparisons:
         warnings.append("Paired net candidates are name-based only; no impedance, coupling, spacing, skew, or length matching has been verified")
     warnings.extend([
+        "Non-copper drawing geometry is separated from copper routing",
         "Route length is computed from IPC-2581 exported geometry, not live CAD constraints",
         "Length comparison is not impedance, skew, timing, or differential-pair validation",
+        "Hole/via evidence is normalized where available, but true connectivity is not proven unless explicitly stated by the source",
+        "Pad primitive dimensions are parsed where possible, but this is not annular-ring or soldermask validation",
+        "Package/library geometry is summarized separately from board routing geometry",
         "No true DRC, net-short, or spacing verification is performed by the converter",
         "Stackup thickness/material may be unavailable or incomplete in IPC-2581 source data",
         "Geometry comes from IPC-2581 manufacturing/export features, not live CAD constraints",
@@ -979,6 +1263,7 @@ def _build_routing_topology_summary(
         "nets": topology_nets,
         "paired_net_geometry_comparison": paired_comparisons,
         "layer_transition_candidates": layer_transition_candidates,
+        "via_hole_by_net": via_hole_by_net,
         "trace_width_by_net": trace_width_by_net,
         "trace_width_usage_by_layer": trace_width_usage_by_layer,
         "route_length_by_net": route_length_by_net,
@@ -994,11 +1279,12 @@ def _build_routing_topology_summary(
     return summary, trace_width_by_net, trace_width_usage_by_layer, route_length_by_net, route_length_by_layer
 
 
-def extract_layerfeature_geometry(root: ET.Element, layers: list[dict[str, Any]], nets: list[dict[str, Any]], units: str | None = None) -> dict[str, Any]:
+def extract_layerfeature_geometry(root: ET.Element, layers: list[dict[str, Any]], nets: list[dict[str, Any]], units: str | None = None, holes_by_net: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     layer_by_name = {l.get("name"): l for l in layers if l.get("name")}
     copper_layer_names = {name for name, layer in layer_by_name.items() if _is_copper_layer(layer)}
     line_descriptors, line_desc_by_id = _parse_line_descriptors(root, units)
     fill_descriptors, fill_desc_by_id = _parse_fill_descriptors(root, units)
+    pad_primitives, pad_primitive_by_id, user_primitives, user_primitive_by_id = _parse_pad_primitives(root, units)
 
     per_net_layer: dict[str, dict[str, dict[str, Any]]] = {}
     layer_totals: dict[str, dict[str, Any]] = {}
@@ -1049,7 +1335,7 @@ def extract_layerfeature_geometry(root: ET.Element, layers: list[dict[str, Any]]
                 line_ref_usage[ref] = line_ref_usage.get(ref, 0) + 1
             for ref in fill_refs:
                 fill_ref_usage[ref] = fill_ref_usage.get(ref, 0) + 1
-            feature_domain = "copper" if layer in copper_layer_names else "non_copper"
+            feature_domain = _layer_feature_domain(layer_by_name.get(layer, {"name": layer}))
             feature_count = counts["polylines"] + counts["polygons"] + counts["pads"] + counts["cutouts"]
             if feature_count:
                 board_feature_summary_rows.append({
@@ -1064,7 +1350,7 @@ def extract_layerfeature_geometry(root: ET.Element, layers: list[dict[str, Any]]
                 points, has_curve = _points_from_geometry(polyline)
                 line_ref = _descriptor_ref(polyline, "LineDescRef")
                 desc = line_desc_by_id.get(line_ref or "")
-                length_summary = _route_length_from_points(points)
+                length_summary = _route_length_from_points(points, units)
                 route_id += 1
                 routes.append({
                     "id": f"route_{route_id:06d}",
@@ -1107,8 +1393,14 @@ def extract_layerfeature_geometry(root: ET.Element, layers: list[dict[str, Any]]
                 x = _to_float(pad.attrib.get("x") or (loc.attrib.get("x") if loc is not None else None))
                 y = _to_float(pad.attrib.get("y") or (loc.attrib.get("y") if loc is not None else None))
                 xform = _first_child(pad, {"Xform", "XForm", "Transform"})
+                std_ref = pad.attrib.get("standardPrimitiveRef") or pad.attrib.get("stdPrimRef") or pad.attrib.get("primitiveRef") or _descriptor_ref(pad, "StandardPrimitiveRef")
+                user_ref = pad.attrib.get("userPrimitiveRef") or _descriptor_ref(pad, "UserPrimitiveRef")
+                resolved = pad_primitive_by_id.get(std_ref or "") or user_primitive_by_id.get(user_ref or "")
+                resolution_status = "not_applicable"
+                if std_ref or user_ref:
+                    resolution_status = "resolved" if resolved else "unresolved"
                 pad_id += 1
-                bbox = {"min_x": x, "min_y": y, "max_x": x, "max_y": y} if x is not None and y is not None else None
+                bbox = _pad_bbox_from_primitive(x, y, resolved) or ({"min_x": x, "min_y": y, "max_x": x, "max_y": y} if x is not None and y is not None else None)
                 pads.append({
                     "id": f"pad_{pad_id:06d}",
                     "source": "ipc2581.LayerFeature.Set.Features.Pad",
@@ -1117,8 +1409,15 @@ def extract_layerfeature_geometry(root: ET.Element, layers: list[dict[str, Any]]
                     "feature_domain": feature_domain,
                     "x": x,
                     "y": y,
-                    "standard_primitive_ref": pad.attrib.get("standardPrimitiveRef") or pad.attrib.get("stdPrimRef") or pad.attrib.get("primitiveRef"),
-                    "user_primitive_ref": pad.attrib.get("userPrimitiveRef"),
+                    "standard_primitive_ref": std_ref,
+                    "user_primitive_ref": user_ref,
+                    "resolved_primitive_id": resolved.get("id") if resolved else None,
+                    "resolved_shape": resolved.get("shape") if resolved else None,
+                    "resolved_width": resolved.get("width") if resolved else None,
+                    "resolved_height": resolved.get("height") if resolved else None,
+                    "resolved_diameter": resolved.get("diameter") if resolved else None,
+                    "resolved_units": resolved.get("units") if resolved else units,
+                    "primitive_resolution_status": resolution_status,
                     "xform": _attrs(xform),
                     "bbox": bbox,
                 })
@@ -1327,6 +1626,7 @@ def extract_layerfeature_geometry(root: ET.Element, layers: list[dict[str, Any]]
         geom_by_net=geom_by_net,
         review_summary=review_summary,
         routes=routes,
+        holes_by_net=holes_by_net,
         legacy_route_segment_count=0,
     )
     board_feature_summary = {
@@ -1380,6 +1680,44 @@ def extract_layerfeature_geometry(root: ET.Element, layers: list[dict[str, Any]]
         "dropped_or_unparsed_feature_count": dropped_or_unparsed,
         "parse_warnings": parse_warnings,
     }
+    copper_routes = [route for route in routes if route.get("feature_domain") == "copper"]
+    non_copper_polylines = [route for route in routes if route.get("feature_domain") != "copper"]
+    copper_polygons = [poly for poly in polygons if poly.get("feature_domain") == "copper"]
+    non_copper_polygons = [poly for poly in polygons if poly.get("feature_domain") != "copper"]
+    copper_pads = [pad for pad in pads if pad.get("feature_domain") == "copper"]
+    non_copper_pads = [pad for pad in pads if pad.get("feature_domain") != "copper"]
+
+    def _count_bucket(rows: list[dict[str, Any]], key_fn) -> list[dict[str, Any]]:
+        buckets: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for feature_type, items in (("route", routes), ("polygon", polygons), ("pad", pads), ("cutout", cutouts)):
+            for item in items:
+                key, base = key_fn(item)
+                bucket = buckets.setdefault(key, {**base, "route_count": 0, "polygon_count": 0, "pad_count": 0, "cutout_count": 0})
+                bucket[f"{feature_type}_count"] += 1
+        return [buckets[k] for k in sorted(buckets, key=lambda x: tuple(str(v) for v in x))]
+
+    route_counts_by_domain = _count_bucket([], lambda item: (
+        (item.get("feature_domain") or "unknown",),
+        {"feature_domain": item.get("feature_domain") or "unknown"},
+    ))
+    route_counts_by_layer_function = _count_bucket([], lambda item: (
+        (item.get("layer"), (layer_by_name.get(item.get("layer")) or {}).get("function") or (layer_by_name.get(item.get("layer")) or {}).get("type"), item.get("feature_domain") or "unknown"),
+        {
+            "layer": item.get("layer"),
+            "function": (layer_by_name.get(item.get("layer")) or {}).get("function") or (layer_by_name.get(item.get("layer")) or {}).get("type"),
+            "feature_domain": item.get("feature_domain") or "unknown",
+        },
+    ))
+    routing_geometry.update({
+        "copper_routes": copper_routes,
+        "non_copper_polylines": non_copper_polylines,
+        "copper_polygons": copper_polygons,
+        "non_copper_polygons": non_copper_polygons,
+        "copper_pads": copper_pads,
+        "non_copper_pads": non_copper_pads,
+        "route_counts_by_domain": route_counts_by_domain,
+        "route_counts_by_layer_function": route_counts_by_layer_function,
+    })
     return {
         "copper_features": shown_copper_features,
         "copper_feature_summary": {
@@ -1395,6 +1733,8 @@ def extract_layerfeature_geometry(root: ET.Element, layers: list[dict[str, Any]]
         "board_feature_summary_rows": board_feature_summary_rows,
         "routing_geometry": routing_geometry,
         "routing_geometry_extraction": routing_geometry_extraction,
+        "pad_primitives": pad_primitives,
+        "user_primitives": user_primitives,
         "line_descriptors": line_descriptors,
         "fill_descriptors": fill_descriptors,
         "routing_topology_summary": routing_topology_summary,
@@ -1557,8 +1897,30 @@ def parse_ipc2581(project_root: Path, files: list[ClassifiedFile]) -> dict[str, 
             stack.append({"name": l.get("name"), "sequence": None, "material": None, "thickness": None, "dielectric_constant": None, "copper_thickness": None, "function": l.get("function"), "side": l.get("side"), "polarity": l.get("polarity")})
         warnings.append({"code":"WARN_IPC_STACKUP_UNAVAILABLE","message":"Material/thickness stackup details unavailable; using known ordered layer metadata."})
     if not layers: warnings.append({"code":"WARN_IPC_LAYERS_UNAVAILABLE","message":"No layers extracted from IPC file."})
+    stackup_data_quality = _build_stackup_data_quality(layers, stack)
 
-    geometry = extract_layerfeature_geometry(root, layers, nets, units)
+    holes, via_holes, plated_holes, nonplated_holes, drill_hole_summary, hole_parse_warnings = _extract_layerfeature_holes(root, units)
+    package_geometry_summary, package_land_patterns = _extract_package_geometry(root)
+    warnings.extend(hole_parse_warnings)
+    holes_by_net: dict[str, dict[str, Any]] = {}
+    for hole in holes:
+        net = hole.get("net")
+        if not net:
+            continue
+        item = holes_by_net.setdefault(net, {"hole_count": 0, "via_hole_count": 0, "plated_hole_count": 0, "nonplated_hole_count": 0, "diameters": set(), "layers": set()})
+        item["hole_count"] += 1
+        if hole.get("hole_type") == "via":
+            item["via_hole_count"] += 1
+        if _upper(hole.get("plating_status")) in {"VIA", "PLATED"}:
+            item["plated_hole_count"] += 1
+        if _upper(hole.get("plating_status")) == "NONPLATED":
+            item["nonplated_hole_count"] += 1
+        if hole.get("diameter") is not None:
+            item["diameters"].add(hole["diameter"])
+        if hole.get("layer"):
+            item["layers"].add(hole["layer"])
+
+    geometry = extract_layerfeature_geometry(root, layers, nets, units, holes_by_net=holes_by_net)
     geometry_counts = geometry.get("geometry_counts", {})
     plated_hole_count = sum(1 for d in drills if (d.get("platingStatus") or "").upper() == "PLATED")
     nonplated_hole_count = sum(1 for d in drills if (d.get("platingStatus") or "").upper() == "NONPLATED")
@@ -1566,7 +1928,7 @@ def parse_ipc2581(project_root: Path, files: list[ClassifiedFile]) -> dict[str, 
     def _norm_layer(v: str | None) -> str:
         return (v or "").upper()
     analysis={"layer_count":len(layers),"layers_used":[l['name'] for l in layers],"ground_plane_layers":[l['name'] for l in layers if _norm_layer(l.get('function') or l.get('type')) in {"PLANE", "GROUND"} or ('GND' in (l['name'] or '').upper())],"signal_layers":[l['name'] for l in layers if _norm_layer(l.get('function') or l.get('type')) in {"CONDUCTOR", "SIGNAL", "INTERNAL"}]}
-    return {"source_file":src.relative_path,"parser_version":IPC_PARSER_VERSION,"ipc_root":ipc_root,"ipc_revision":rev,"namespace":ns,"units":units,"components":components,"nets":nets,"physical_nets":physical_nets,"layers":layers,"stackup_layers":stack,"outline":outline,"vias":vias,"drills":drills,"route_segments":routes,"analysis":analysis,"warnings":warnings,"extraction_counts":counts,**geometry}
+    return {"source_file":src.relative_path,"parser_version":IPC_PARSER_VERSION,"ipc_root":ipc_root,"ipc_revision":rev,"namespace":ns,"units":units,"components":components,"nets":nets,"physical_nets":physical_nets,"layers":layers,"stackup_layers":stack,"stackup_data_quality":stackup_data_quality,"outline":outline,"vias":vias,"drills":drills,"holes":holes,"via_holes":via_holes,"plated_holes":plated_holes,"nonplated_holes":nonplated_holes,"drill_hole_summary":drill_hole_summary,"package_geometry_summary":package_geometry_summary,"package_land_patterns":package_land_patterns,"route_segments":routes,"analysis":analysis,"warnings":warnings,"extraction_counts":counts,**geometry}
 
 
 def build_board_export(project_name:str, project_root:Path, ipc:dict[str,Any])->dict[str,Any]:
@@ -1580,9 +1942,15 @@ def build_board_export(project_name:str, project_root:Path, ipc:dict[str,Any])->
         "nets": ipc.get("nets", []),
         "physical_nets": ipc.get("physical_nets", []),
         "layers": ipc.get("layers", []),
+        "stackup_data_quality": ipc.get("stackup_data_quality", {}),
         "board_outline": ipc.get("outline", []),
         "vias": ipc.get("vias", []),
         "drills": ipc.get("drills", []),
+        "drill_hole_summary": ipc.get("drill_hole_summary", {}),
+        "holes": ipc.get("holes", []),
+        "via_holes": ipc.get("via_holes", []),
+        "plated_holes": ipc.get("plated_holes", []),
+        "nonplated_holes": ipc.get("nonplated_holes", []),
         "routes": ipc.get("route_segments", []),
         "analysis": ipc.get("analysis", {}),
         "copper_feature_summary": ipc.get("copper_feature_summary", {}),
@@ -1598,6 +1966,10 @@ def build_board_export(project_name:str, project_root:Path, ipc:dict[str,Any])->
         "trace_width_usage_by_layer": ipc.get("trace_width_usage_by_layer", []),
         "route_length_by_net": ipc.get("route_length_by_net", []),
         "route_length_by_layer": ipc.get("route_length_by_layer", []),
+        "pad_primitives": ipc.get("pad_primitives", []),
+        "user_primitives": ipc.get("user_primitives", []),
+        "package_geometry_summary": ipc.get("package_geometry_summary", {}),
+        "package_land_patterns": ipc.get("package_land_patterns", []),
         "line_descriptors": ipc.get("line_descriptors", []),
         "fill_descriptors": ipc.get("fill_descriptors", []),
         "review_geometry_summary": ipc.get("review_geometry_summary", {}),
@@ -1609,7 +1981,7 @@ def build_board_export(project_name:str, project_root:Path, ipc:dict[str,Any])->
 
 
 def build_stack_export(project_name:str, project_root:Path, ipc:dict[str,Any])->dict[str,Any]:
-    return {"project_name":project_name,"source":{"project_root":str(project_root),"layout_file":ipc.get('source_file'),"format":"ipc2581"},"parser_version":ipc.get('parser_version'),"units":ipc.get('units'),"layer_stack":ipc.get('stackup_layers',[]),"layers":ipc.get('stackup_layers',[]),"warnings":ipc.get('warnings',[]),"extraction_counts":{"stackup_layer_count":ipc.get('extraction_counts',{}).get('stackup_layer_count',0),"layer_count":ipc.get('extraction_counts',{}).get('layer_count',0)}}
+    return {"project_name":project_name,"source":{"project_root":str(project_root),"layout_file":ipc.get('source_file'),"format":"ipc2581"},"parser_version":ipc.get('parser_version'),"units":ipc.get('units'),"layer_stack":ipc.get('stackup_layers',[]),"layers":ipc.get('stackup_layers',[]),"stackup_data_quality":ipc.get("stackup_data_quality",{}),"warnings":ipc.get('warnings',[]),"extraction_counts":{"stackup_layer_count":ipc.get('extraction_counts',{}).get('stackup_layer_count',0),"layer_count":ipc.get('extraction_counts',{}).get('layer_count',0)}}
 
 
 def render_pdf_images(args: argparse.Namespace, project_root: Path, output_root: Path, project_name: str, files: list[ClassifiedFile]) -> dict[str, Any]:
@@ -1764,8 +2136,13 @@ def build_report(args: argparse.Namespace, project_root: Path, output_root: Path
         p for p in routing_topology.get("paired_net_geometry_comparison", [])
         if isinstance((p.get("comparison") or {}).get("route_length_delta"), (int, float))
     ]
+    routing_geometry = ipc.get("routing_geometry", {})
+    pad_rows = routing_geometry.get("pads", [])
+    resolved_pads = [p for p in pad_rows if p.get("primitive_resolution_status") == "resolved"]
+    unresolved_pads = [p for p in pad_rows if p.get("primitive_resolution_status") == "unresolved"]
+    package_geometry_summary = ipc.get("package_geometry_summary", {})
 
-    return {
+    report = {
         "metadata": {
             "converter": "thomson_bundle_converter", "version": VERSION, "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "project_root": str(project_root), "project_name": project_name, "output_root": str(output_root), "args": vars(args), "phase": "phase6_integrated_validation",
@@ -1792,7 +2169,7 @@ def build_report(args: argparse.Namespace, project_root: Path, output_root: Path
             "json_validation": {"status": "skipped" if args.dry_run or args.report_only else "pending"},
         },
         "planned_outputs": planned_outputs(project_name, output_root),
-        "ipc2581": {"source_file": ipc.get("source_file"), "root": ipc.get("ipc_root"), "revision": ipc.get("ipc_revision"), "namespace": ipc.get("namespace"), "component_count": ipc.get("extraction_counts", {}).get("board_component_count", 0), "placement_count": ipc.get("extraction_counts", {}).get("placement_count", 0), "placements_with_xy_count": ipc.get("extraction_counts", {}).get("placements_with_xy_count", 0), "net_count": ipc.get("extraction_counts", {}).get("board_net_count", 0), "logical_net_count": ipc.get("extraction_counts", {}).get("logical_net_count", 0), "physical_net_count": ipc.get("extraction_counts", {}).get("physical_net_count", 0), "phy_net_point_count": ipc.get("extraction_counts", {}).get("phy_net_point_count", 0), "layer_count": ipc.get("extraction_counts", {}).get("layer_count", 0), "stackup_layer_count": ipc.get("extraction_counts", {}).get("stackup_layer_count", 0), "via_count": ipc.get("extraction_counts", {}).get("via_count", 0), "drill_count": ipc.get("extraction_counts", {}).get("drill_count", 0), "route_segment_count": ipc.get("extraction_counts", {}).get("route_segment_count", 0), "outline_point_count": ipc.get("extraction_counts", {}).get("outline_point_count", 0), "copper_feature_extraction_enabled": True, "layerfeature_count": ipc.get("extraction_counts", {}).get("layerfeature_count", 0), "set_count": ipc.get("extraction_counts", {}).get("set_count", 0), "polyline_object_count": ipc.get("extraction_counts", {}).get("polyline_object_count", 0), "polygon_object_count": ipc.get("extraction_counts", {}).get("polygon_object_count", 0), "pad_object_count": ipc.get("extraction_counts", {}).get("pad_object_count", 0), "cutout_object_count": ipc.get("extraction_counts", {}).get("cutout_object_count", 0), "detailed_geometry_truncated": ipc.get("extraction_counts", {}).get("detailed_geometry_truncated", False), "review_geometry_summary_counts": {"copper_layers": len(ipc.get("review_geometry_summary", {}).get("copper_layers", [])), "non_copper_layers": len(ipc.get("review_geometry_summary", {}).get("non_copper_layers", [])), "net_layer_presence": len(ipc.get("review_geometry_summary", {}).get("net_layer_presence", [])), "plane_candidates": len(ipc.get("review_geometry_summary", {}).get("plane_candidates", [])), "routing_candidates": len(ipc.get("review_geometry_summary", {}).get("routing_candidates", [])), "pad_only_nets": len(ipc.get("review_geometry_summary", {}).get("pad_only_nets", [])), "candidate_differential_or_paired_nets": len(ipc.get("review_geometry_summary", {}).get("candidate_differential_or_paired_nets", []))}, "routing_topology_summary_enabled": bool(routing_topology), "routed_net_count": routing_topology.get("routed_net_count", 0), "pad_only_net_count": routing_topology.get("pad_only_net_count", 0), "paired_net_geometry_comparison_count": len(routing_topology.get("paired_net_geometry_comparison", [])), "layer_transition_candidate_count": len(routing_topology.get("layer_transition_candidates", [])), "trace_width_by_net_count": len(trace_width_by_net), "trace_width_usage_by_layer_count": len(trace_width_usage_by_layer), "routing_evidence_warning_count": len(routing_topology.get("routing_evidence_warnings", [])), "parse_warnings": ipc.get("warnings", []), "board_output_file": str(output_root / f"{project_name}-thomson-export-brd.json"), "stack_output_file": str(output_root / f"{project_name}-thomson-export-stack.json"), "board_json_validation": {"status": "skipped" if args.dry_run or args.report_only else "pending"}, "stack_json_validation": {"status": "skipped" if args.dry_run or args.report_only else "pending"}},
+        "ipc2581": {"source_file": ipc.get("source_file"), "root": ipc.get("ipc_root"), "revision": ipc.get("ipc_revision"), "namespace": ipc.get("namespace"), "component_count": ipc.get("extraction_counts", {}).get("board_component_count", 0), "placement_count": ipc.get("extraction_counts", {}).get("placement_count", 0), "placements_with_xy_count": ipc.get("extraction_counts", {}).get("placements_with_xy_count", 0), "net_count": ipc.get("extraction_counts", {}).get("board_net_count", 0), "logical_net_count": ipc.get("extraction_counts", {}).get("logical_net_count", 0), "physical_net_count": ipc.get("extraction_counts", {}).get("physical_net_count", 0), "phy_net_point_count": ipc.get("extraction_counts", {}).get("phy_net_point_count", 0), "layer_count": ipc.get("extraction_counts", {}).get("layer_count", 0), "stackup_layer_count": ipc.get("extraction_counts", {}).get("stackup_layer_count", 0), "via_count": ipc.get("extraction_counts", {}).get("via_count", 0), "drill_count": ipc.get("extraction_counts", {}).get("drill_count", 0), "route_segment_count": ipc.get("extraction_counts", {}).get("route_segment_count", 0), "outline_point_count": ipc.get("extraction_counts", {}).get("outline_point_count", 0), "copper_feature_extraction_enabled": True, "layerfeature_count": ipc.get("extraction_counts", {}).get("layerfeature_count", 0), "set_count": ipc.get("extraction_counts", {}).get("set_count", 0), "polyline_object_count": ipc.get("extraction_counts", {}).get("polyline_object_count", 0), "polygon_object_count": ipc.get("extraction_counts", {}).get("polygon_object_count", 0), "pad_object_count": ipc.get("extraction_counts", {}).get("pad_object_count", 0), "cutout_object_count": ipc.get("extraction_counts", {}).get("cutout_object_count", 0), "detailed_geometry_truncated": ipc.get("extraction_counts", {}).get("detailed_geometry_truncated", False), "review_geometry_summary_counts": {"copper_layers": len(ipc.get("review_geometry_summary", {}).get("copper_layers", [])), "non_copper_layers": len(ipc.get("review_geometry_summary", {}).get("non_copper_layers", [])), "net_layer_presence": len(ipc.get("review_geometry_summary", {}).get("net_layer_presence", [])), "plane_candidates": len(ipc.get("review_geometry_summary", {}).get("plane_candidates", [])), "routing_candidates": len(ipc.get("review_geometry_summary", {}).get("routing_candidates", [])), "pad_only_nets": len(ipc.get("review_geometry_summary", {}).get("pad_only_nets", [])), "candidate_differential_or_paired_nets": len(ipc.get("review_geometry_summary", {}).get("candidate_differential_or_paired_nets", []))}, "routing_topology_summary_enabled": bool(routing_topology), "routed_net_count": routing_topology.get("routed_net_count", 0), "pad_only_net_count": routing_topology.get("pad_only_net_count", 0), "paired_net_geometry_comparison_count": len(routing_topology.get("paired_net_geometry_comparison", [])), "layer_transition_candidate_count": len(routing_topology.get("layer_transition_candidates", [])), "trace_width_by_net_count": len(trace_width_by_net), "trace_width_usage_by_layer_count": len(trace_width_usage_by_layer), "route_length_summary_enabled": True, "route_length_by_net_count": len(route_length_by_net), "route_length_by_layer_count": len(route_length_by_layer), "routes_with_length_count": len(routes_with_length), "routes_with_estimated_length_count": len(routes_with_estimated_length), "paired_net_length_comparison_count": len(paired_length_comparisons), "routing_evidence_warning_count": len(routing_topology.get("routing_evidence_warnings", [])), "parse_warnings": ipc.get("warnings", []), "board_output_file": str(output_root / f"{project_name}-thomson-export-brd.json"), "stack_output_file": str(output_root / f"{project_name}-thomson-export-stack.json"), "board_json_validation": {"status": "skipped" if args.dry_run or args.report_only else "pending"}, "stack_json_validation": {"status": "skipped" if args.dry_run or args.report_only else "pending"}},
         "images": images.get("report", {}),
         "image_outputs": images.get("image_outputs", []),
         "validation": {},
@@ -1803,6 +2180,26 @@ def build_report(args: argparse.Namespace, project_root: Path, output_root: Path
             "WARNING: tools/kicad-export.py not found in this repository snapshot; schematic shape uses a compatibility-oriented best effort.",
         ],
     }
+    report["ipc2581"].update({
+        "copper_route_count": len(routing_geometry.get("copper_routes", [])),
+        "non_copper_polyline_count": len(routing_geometry.get("non_copper_polylines", [])),
+        "copper_polygon_count": len(routing_geometry.get("copper_polygons", [])),
+        "non_copper_polygon_count": len(routing_geometry.get("non_copper_polygons", [])),
+        "copper_pad_count": len(routing_geometry.get("copper_pads", [])),
+        "non_copper_pad_count": len(routing_geometry.get("non_copper_pads", [])),
+        "hole_count": len(ipc.get("holes", [])),
+        "via_hole_count": len(ipc.get("via_holes", [])),
+        "plated_hole_count": len(ipc.get("plated_holes", [])),
+        "nonplated_hole_count": len(ipc.get("nonplated_holes", [])),
+        "pad_primitive_count": len(ipc.get("pad_primitives", [])),
+        "resolved_pad_primitive_count": len(resolved_pads),
+        "unresolved_pad_primitive_count": len(unresolved_pads),
+        "package_geometry_summary_enabled": bool(package_geometry_summary),
+        "package_count": package_geometry_summary.get("package_count", 0),
+        "package_landpattern_pad_count": package_geometry_summary.get("landpattern_pad_count", 0),
+        "stackup_data_quality_available": bool(ipc.get("stackup_data_quality")),
+    })
+    return report
 
 
 def report_markdown(report: dict[str, Any]) -> str:

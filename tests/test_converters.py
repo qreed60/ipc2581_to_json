@@ -378,6 +378,12 @@ def test_phase610_review_geometry_summary(tmp_path):
     assert brd["routing_geometry"]["polygons"]
     assert brd["routing_geometry"]["pads"]
     assert brd["routing_geometry"]["cutouts"]
+    can_rx_route = next(r for r in brd["routing_geometry"]["routes"] if r["net"] == "CAN_RX")
+    assert can_rx_route["length"] > 0
+    assert can_rx_route["length_units"] == "INCH"
+    assert can_rx_route["length_is_estimated"] is False
+    assert can_rx_route["segment_count"] == 1
+    assert can_rx_route["curve_count"] == 0
     assert brd["routing_geometry_extraction"]["normalized_route_count"] == 5
     assert brd["routing_geometry_extraction"]["dropped_or_unparsed_feature_count"] == 0
     assert any(d["id"] == "ROUND_500" and d["width"] == 0.005 for d in brd["line_descriptors"])
@@ -389,6 +395,8 @@ def test_phase610_review_geometry_summary(tmp_path):
     assert topology["nets"]
     assert topology["trace_width_by_net"]
     assert topology["trace_width_usage_by_layer"]
+    assert topology["route_length_by_net"]
+    assert topology["route_length_by_layer"]
     topo_can_rx = next(n for n in topology["nets"] if n["net"] == "CAN_RX")
     assert topo_can_rx["route_count"] > 0
     assert topo_can_rx["min_trace_width"] == 0.005
@@ -401,10 +409,20 @@ def test_phase610_review_geometry_summary(tmp_path):
     assert can_rx_trace["max_trace_width"] == 0.005
     assert can_rx_trace["route_count"] > 0
     assert "TOP" in can_rx_trace["layers"]
-    assert any(set(p["pair"]) == {"CAN_HI", "CAN_LO"} for p in topology["paired_net_geometry_comparison"])
+    can_rx_length = next(t for t in topology["route_length_by_net"] if t["net"] == "CAN_RX")
+    assert can_rx_length["total_route_length"] > 0
+    assert can_rx_length["length_units"] == "INCH"
+    assert can_rx_length["route_count"] == 1
+    assert can_rx_length["length_is_estimated"] is False
+    assert any(t["layer"] == "TOP" and t["total_route_length"] > 0 for t in topology["route_length_by_layer"])
+    can_pair = next(p for p in topology["paired_net_geometry_comparison"] if set(p["pair"]) == {"CAN_HI", "CAN_LO"})
+    assert "route_length_delta" in can_pair["comparison"]
+    assert can_pair["comparison"]["route_length_delta_units"] == "INCH"
     assert any(c["net"] == "GND" for c in topology["layer_transition_candidates"]) is False
     assert any(t["net"] == "CAN_RX" and t["route_count"] > 0 for t in brd["trace_width_by_net"])
     assert any(t["layer"] == "TOP" and t["line_desc_ref"] == "ROUND_500" for t in brd["trace_width_usage_by_layer"])
+    assert any(t["net"] == "CAN_RX" and t["total_route_length"] > 0 for t in brd["route_length_by_net"])
+    assert any(t["layer"] == "TOP" and t["total_route_length"] > 0 for t in brd["route_length_by_layer"])
     assert any("No true DRC" in w for w in topology["routing_evidence_warnings"])
     assert brd["extraction_counts"]["route_segment_count"] == 0
     assert len(brd["routing_geometry"]["routes"]) > 0
@@ -429,6 +447,11 @@ def test_phase610_review_geometry_summary(tmp_path):
     assert ipc_report["paired_net_geometry_comparison_count"] >= 1
     assert ipc_report["trace_width_by_net_count"] == len(topology["trace_width_by_net"])
     assert ipc_report["trace_width_usage_by_layer_count"] == len(topology["trace_width_usage_by_layer"])
+    assert ipc_report["route_length_summary_enabled"] is True
+    assert ipc_report["route_length_by_net_count"] == len(topology["route_length_by_net"])
+    assert ipc_report["route_length_by_layer_count"] == len(topology["route_length_by_layer"])
+    assert ipc_report["routes_with_length_count"] == len(brd["routing_geometry"]["routes"])
+    assert ipc_report["paired_net_length_comparison_count"] == len([p for p in topology["paired_net_geometry_comparison"] if p["comparison"].get("route_length_delta") is not None])
     assert ipc_report["routing_evidence_warning_count"] >= 1
 
 
@@ -444,8 +467,32 @@ def test_phase611_real_examples_routing_geometry_if_present(tmp_path):
     routing = brd["routing_geometry"]
     review = brd["review_geometry_summary"]
     assert routing["routes"]
+    assert routing["copper_routes"]
+    assert routing["non_copper_polylines"]
+    assert len(routing["copper_routes"]) + len(routing["non_copper_polylines"]) == len(routing["routes"])
+    assert routing["copper_polygons"]
+    assert routing["non_copper_polygons"]
+    assert routing["copper_pads"]
+    assert routing["non_copper_pads"]
+    assert routing["route_counts_by_domain"]
+    assert routing["route_counts_by_layer_function"]
+    assert any(r.get("length", 0) > 0 for r in routing["routes"])
     assert routing["polygons"]
     assert routing["pads"]
+    assert brd["drill_hole_summary"]
+    assert brd["holes"]
+    assert brd["via_holes"]
+    assert len(brd["holes"]) == brd["drill_hole_summary"]["total_holes"]
+    assert len(brd["via_holes"]) == brd["drill_hole_summary"]["via_holes"]
+    assert brd["pad_primitives"]
+    assert any(p["shape"] == "circle" for p in brd["pad_primitives"])
+    assert any(p["shape"] == "rect_center" for p in brd["pad_primitives"])
+    assert any(p.get("primitive_resolution_status") == "resolved" for p in routing["pads"])
+    assert brd["package_geometry_summary"]["package_count"] > 0
+    assert brd["package_geometry_summary"]["landpattern_pad_count"] > 0
+    assert brd["package_land_patterns"]
+    assert brd["stackup_data_quality"]["material_thickness_available"] is False
+    assert brd["stackup_data_quality"]["impedance_rules_available"] is False
     assert brd["routing_geometry_extraction"]["dropped_or_unparsed_feature_count"] == 0
     assert brd["line_descriptors"]
     assert any(d["id"] == "ROUND_500" for d in brd["line_descriptors"])
@@ -455,6 +502,9 @@ def test_phase611_real_examples_routing_geometry_if_present(tmp_path):
     topology = brd["routing_topology_summary"]
     assert topology["trace_width_by_net"]
     assert topology["trace_width_usage_by_layer"]
+    assert topology["route_length_by_net"]
+    assert topology["route_length_by_layer"]
+    assert topology["via_hole_by_net"]
     topo_can_rx = next(n for n in topology["nets"] if n["net"] == "CAN_RX")
     assert topo_can_rx["route_count"] > 0
     assert topo_can_rx["min_trace_width"] is not None
@@ -463,10 +513,22 @@ def test_phase611_real_examples_routing_geometry_if_present(tmp_path):
     assert "ROUND_500" in can_rx_trace["line_desc_refs"]
     assert can_rx_trace["min_trace_width"] == 0.005
     assert can_rx_trace["max_trace_width"] == 0.005
-    assert any(set(p["pair"]) == {"CAN_HI", "CAN_LO"} for p in topology["paired_net_geometry_comparison"])
+    can_rx_route = next(r for r in routing["routes"] if r["net"] == "CAN_RX")
+    assert can_rx_route["length"] > 0
+    can_rx_length = next(t for t in topology["route_length_by_net"] if t["net"] == "CAN_RX")
+    assert can_rx_length["total_route_length"] > 0
+    assert can_rx_length["length_units"] == "INCH"
+    assert any(t["total_route_length"] > 0 for t in topology["route_length_by_layer"])
+    can_pair = next(p for p in topology["paired_net_geometry_comparison"] if set(p["pair"]) == {"CAN_HI", "CAN_LO"})
+    assert "route_length_delta" in can_pair["comparison"]
     assert any(c["net"] == "GND" for c in topology["layer_transition_candidates"])
+    assert any(c["net"] == "GND" and c["via_hole_count"] > 0 for c in topology["via_hole_by_net"])
     assert any(t["net"] == "CAN_RX" for t in brd["trace_width_by_net"])
     assert any("Geometry comes from IPC-2581" in w for w in topology["routing_evidence_warnings"])
+    assert any("Non-copper drawing geometry is separated" in w for w in topology["routing_evidence_warnings"])
+    assert any("Hole/via evidence is normalized" in w for w in topology["routing_evidence_warnings"])
+    assert any("Pad primitive dimensions are parsed" in w for w in topology["routing_evidence_warnings"])
+    assert any("Package/library geometry is summarized" in w for w in topology["routing_evidence_warnings"])
     assert brd["extraction_counts"]["route_segment_count"] == 0
     assert len(routing["routes"]) > 0
     plane_nets = {p["net"] for p in review["plane_candidates"]}
@@ -481,8 +543,30 @@ def test_phase611_real_examples_routing_geometry_if_present(tmp_path):
 
     report = json.loads((out / "example-conversion-report.json").read_text())
     ipc_report = report["ipc2581"]
+    assert ipc_report["copper_route_count"] == len(routing["copper_routes"])
+    assert ipc_report["non_copper_polyline_count"] == len(routing["non_copper_polylines"])
+    assert ipc_report["copper_polygon_count"] == len(routing["copper_polygons"])
+    assert ipc_report["non_copper_polygon_count"] == len(routing["non_copper_polygons"])
+    assert ipc_report["copper_pad_count"] == len(routing["copper_pads"])
+    assert ipc_report["non_copper_pad_count"] == len(routing["non_copper_pads"])
+    assert ipc_report["hole_count"] == len(brd["holes"])
+    assert ipc_report["via_hole_count"] == len(brd["via_holes"])
+    assert ipc_report["plated_hole_count"] == len(brd["plated_holes"])
+    assert ipc_report["nonplated_hole_count"] == len(brd["nonplated_holes"])
+    assert ipc_report["pad_primitive_count"] == len(brd["pad_primitives"])
+    assert ipc_report["resolved_pad_primitive_count"] == len([p for p in routing["pads"] if p.get("primitive_resolution_status") == "resolved"])
+    assert ipc_report["unresolved_pad_primitive_count"] == len([p for p in routing["pads"] if p.get("primitive_resolution_status") == "unresolved"])
+    assert ipc_report["package_geometry_summary_enabled"] is True
+    assert ipc_report["package_count"] == brd["package_geometry_summary"]["package_count"]
+    assert ipc_report["package_landpattern_pad_count"] == brd["package_geometry_summary"]["landpattern_pad_count"]
+    assert ipc_report["stackup_data_quality_available"] is True
     assert ipc_report["trace_width_by_net_count"] == len(topology["trace_width_by_net"])
     assert ipc_report["trace_width_usage_by_layer_count"] == len(topology["trace_width_usage_by_layer"])
+    assert ipc_report["route_length_summary_enabled"] is True
+    assert ipc_report["route_length_by_net_count"] == len(topology["route_length_by_net"])
+    assert ipc_report["route_length_by_layer_count"] == len(topology["route_length_by_layer"])
+    assert ipc_report["routes_with_length_count"] == len(routing["routes"])
+    assert ipc_report["paired_net_length_comparison_count"] == len([p for p in topology["paired_net_geometry_comparison"] if p["comparison"].get("route_length_delta") is not None])
 
 
 def test_phase66_pads_multinode_line_and_numbered_mfg_headers(tmp_path):
